@@ -14,6 +14,7 @@ export function createCustomIdRecognizer(patterns: CustomIdPattern[]): Recognize
   return {
     type: PIIType.CASE_ID, // Default type, will be overridden per pattern
     name: 'Custom ID',
+    id: 'case-id',
     defaultConfidence: 0.9,
 
     find(text: string): SpanMatch[] {
@@ -22,6 +23,8 @@ export function createCustomIdRecognizer(patterns: CustomIdPattern[]): Recognize
 
       for (const patternConfig of patterns) {
         const { pattern, type, validate } = patternConfig;
+        // 归因用规则名：改名不影响已落盘记录的检测器标识
+        const recognizerId = `case-id:${patternConfig.name}`;
 
         // Ensure pattern has global flag
         const globalPattern = pattern.global
@@ -49,6 +52,7 @@ export function createCustomIdRecognizer(patterns: CustomIdPattern[]): Recognize
             confidence: 0.9,
             source: DetectionSource.REGEX,
             text: idText,
+            recognizer: recognizerId,
           });
         }
       }

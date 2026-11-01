@@ -24,6 +24,7 @@ function base64urlDecode(str: string): string | null {
 export const jwtRecognizer = createRegexRecognizer({
   type: PIIType.JWT,
   name: "JWT",
+  id: 'jwt',
   defaultConfidence: 0.95,
   patterns: [
     // JWT: eyJ header prefix, three base64url segments separated by dots

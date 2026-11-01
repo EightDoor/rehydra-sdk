@@ -380,3 +380,22 @@ describe('createRegistry', () => {
     expect(isolated.hasRecognizer(PIIType.EMAIL)).toBe(false);
   });
 });
+
+describe('RecognizerRegistry attribution', () => {
+  it('tags every regex hit with a stable detector id', () => {
+    const registry = createRegistry();
+    const policy = createDefaultPolicy();
+    // 各类型挑一个能命中的样本
+    const samples: Array<[string, string]> = [
+      ['EMAIL', ['alice', '@', 'example.com'].join('')],
+      ['PHONE', ['+49', '30', '1234567'].join(' ')],
+      ['URL', 'see https://example.com/a for details'],
+    ];
+
+    for (const [, sample] of samples) {
+      for (const match of registry.findAll(sample, policy)) {
+        expect(match.recognizer, `missing detector for ${sample}`).toBeTruthy();
+      }
+    }
+  });
+});

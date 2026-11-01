@@ -97,6 +97,20 @@ Only the values of **sensitive fields** in an `.env` file enter the global known
 
 Collection fields in `policy` may be written as arrays and thresholds as plain objects (programmatic callers may use `Set` / `Map`); an invalid field type fails at startup with the field name instead of silently dropping the protection rule.
 
+## Per-request masking records
+
+The Pi extension can record masking results per request so you can check for false positives:
+
+```json
+{
+  "rehydra": {
+    "record": { "enabled": true, "includeOriginal": true }
+  }
+}
+```
+
+`/rehydra log` shows recent records for the session, `/rehydra log <id>` shows hits with field-level before/after, `/rehydra clear --all` removes them. Recording is off by default; when enabled it writes to `~/.pi/agent/rehydra/records/` (0700 / 0600) and trims by age and total size. With `includeOriginal: false` only the type, detector, placeholder and offsets are kept.
+
 ## Address detection
 
 The default regex registry detects UK postcode syntax and numbered English-language street addresses such as `34a Friskin Road`. Apartment identifiers are included when adjacent to a street address, as in `Flat 1\n34a Friskin Road`. A contiguous UK address block ending in a postcode is masked as one `ADDRESS`; a standalone postcode uses `POSTAL_CODE`. Bare apartment numbers, unnumbered buildings, and other countries' postal formats need custom recognizers or NER. Postcode matching checks syntax, not whether a postcode is currently assigned.

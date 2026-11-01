@@ -35,6 +35,7 @@ export function createEnvVarSecretRecognizer(
   return {
     type: PIIType.ENV_VAR_SECRET,
     name: "Environment Variable Secret",
+    id: 'env-var',
     defaultConfidence: 0.88,
 
     find(text: string): SpanMatch[] {

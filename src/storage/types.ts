@@ -10,6 +10,7 @@ import type {
   AnonymizationResult,
   AnonymizationPolicy,
 } from "../types/index.js";
+import type { AnonymizeRun, PiiObserver } from "../core/observer.js";
 
 /**
  * Metadata associated with a stored PII map
@@ -152,7 +153,9 @@ export interface AnonymizerSession {
   anonymize(
     text: string,
     locale?: string,
-    policy?: Partial<AnonymizationPolicy>
+    policy?: Partial<AnonymizationPolicy>,
+    observer?: PiiObserver,
+    run?: AnonymizeRun
   ): Promise<AnonymizationResult>;
 
   /**

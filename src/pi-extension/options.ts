@@ -45,4 +45,20 @@ export interface RehydraPiExtensionOptions {
 
   /** Tag format configuration. */
   tagFormat?: TagFormat;
+
+  /** 脱敏记录：默认关闭，开启后按请求记录命中与对照。 */
+  record?: {
+    enabled?: boolean;
+    /** 是否保存原文与全文对照（默认 false）。 */
+    includeOriginal?: boolean;
+    keepInMemory?: number;
+    keepDays?: number;
+    keepBytes?: number;
+    maxRecordBytes?: number;
+    /** 记录目录，缺省为 `<cwd>/../.pi/agent/rehydra/records` 之外的显式配置。 */
+    dir?: string;
+  };
+
+  /** 模型检测不可用时的处理：默认降级为规则。 */
+  nerFailure?: "rules" | "block";
 }

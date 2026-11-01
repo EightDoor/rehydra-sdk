@@ -274,8 +274,12 @@ export class NERModel {
         ? 0
         : inputText.length;
 
+    const recognizerId = `ner:${this.version}`;
     return {
-      spans: mergeWindowSpans(spans, originalText),
+      spans: mergeWindowSpans(spans, originalText).map((span) => ({
+        ...span,
+        recognizer: span.recognizer ?? recognizerId,
+      })),
       truncated: tokenization.truncated,
       coverageChars,
     };

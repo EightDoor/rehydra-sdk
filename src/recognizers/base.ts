@@ -15,6 +15,11 @@ export interface Recognizer {
   /** Human-readable name for logging/debugging */
   readonly name: string;
 
+  /**
+   * 稳定识别器标识。缺失时由名称派生；显式给出时改显示名不影响已落盘记录的归因。
+   */
+  readonly id?: string;
+
   /** Default confidence score for matches (0.0 to 1.0) */
   readonly defaultConfidence: number;
 
@@ -124,6 +129,8 @@ export abstract class RegexRecognizer implements Recognizer {
 export interface RegexRecognizerConfig {
   type: PIIType;
   name: string;
+  /** 稳定识别器标识；缺省时由名称派生。 */
+  id?: string;
   patterns: RegExp[];
   defaultConfidence?: number;
   validate?: (match: string) => boolean;
@@ -137,6 +144,7 @@ export function createRegexRecognizer(config: RegexRecognizerConfig): Recognizer
   return {
     type: config.type,
     name: config.name,
+    id: config.id,
     defaultConfidence: config.defaultConfidence ?? 0.95,
 
     find(text: string): SpanMatch[] {

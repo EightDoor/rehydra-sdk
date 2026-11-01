@@ -25,6 +25,7 @@ export function createConfigSecretRecognizer(
   return {
     type: PIIType.CONFIG_SECRET,
     name: "Config Secret",
+    id: 'config-secret',
     defaultConfidence: 0.85,
 
     find(text: string): SpanMatch[] {

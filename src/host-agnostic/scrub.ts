@@ -16,6 +16,7 @@ import type {
   AnonymizationPolicy,
 } from "../types/index.js";
 import type { AnonymizerSessionImpl } from "../storage/session-base.js";
+import type { ObservedEntity } from "../core/observer.js";
 
 /** 宿主暴露给共享脱敏核心的回调集合。 */
 export interface ScrubHost {
@@ -64,6 +65,10 @@ export interface ScrubCoreOptions {
   locale?: string;
   /** 默认脱敏策略；每个 part 都会再叠加自己的策略增量。 */
   policy?: Partial<AnonymizationPolicy>;
+  /** 本次事件的模型调用预算（毫秒），同事件所有字段共享。 */
+  deadlineMs?: number;
+  /** 宿主取消信号：取消直接结束，不降级。 */
+  signal?: AbortSignal;
 }
 
 /** 一个 part（V2 `content` 或 V1 `parts`）的最小可写接口。 */
@@ -96,10 +101,66 @@ export interface ScrubMessage {
   [key: string]: unknown;
 }
 
-/** 一次脱敏的统计结果。 */
+/** 一条命中的采集结果（不含原值）。 */
+export interface ScrubHit {
+  type: string;
+  detector: string;
+  placeholder: string;
+  length: number;
+  start: number;
+  end: number;
+  original?: string;
+}
+
+/** 字段级对照。 */
+export interface ScrubComparison {
+  path: string;
+  before: string;
+  after: string;
+  truncated?: boolean;
+}
+
+/** 一次脱敏的统计与采集结果。 */
 export interface ScrubCoreStats {
   scrubbed: number;
   byType: Record<string, number>;
+  /** 命中明细；未开启采集时为空。 */
+  hits?: ScrubHit[];
+  /** 字段级对照；只覆盖内容变化的字段。 */
+  comparisons?: ScrubComparison[];
+  /** 对照是否因预算被截断。 */
+  truncated?: boolean;
+  /** 检测完整性：`rules-only` 表示模型检测失败后降级。 */
+  integrity?: "complete" | "rules-only";
+  /** 降级的检测器错误码。 */
+  detectionErrors?: Array<{ finder: "model"; code: string }>;
+}
+
+/** 累计统计与检测完整性（跨字段共享）。 */
+interface ScrubAccumulator {
+  count: number;
+  byType: Record<string, number>;
+  integrity?: "complete" | "rules-only";
+  detectionErrors?: Array<{ finder: "model"; code: string }>;
+}
+
+/** 一次宿主事件的预算：deadline 让同事件多字段共享模型调用时间。 */
+interface ScrubBudget {
+  deadline?: number;
+  signal?: AbortSignal;
+}
+
+/** 采集器：由调用方决定是否创建，未创建时整条路径零开销。 */
+interface Collector {
+  hits: ScrubHit[];
+  includeOriginal: boolean;
+}
+
+/** 一次 scrub 的落盘预算与开关。 */
+export interface ScrubCollectOptions {
+  includeOriginal: boolean;
+  /** 对照总字节上限。 */
+  maxRecordBytes: number;
 }
 
 /** 把字符串按策略过一道匿名化。 */
@@ -108,9 +169,53 @@ async function scrubString(
   session: AnonymizerSessionImpl,
   policy: Partial<AnonymizationPolicy> | undefined,
   locale: string | undefined,
-  stats: { count: number; byType: Record<string, number> },
+  stats: ScrubAccumulator,
+  collector?: Collector,
+  budget?: ScrubBudget,
 ): Promise<string> {
-  const result = await session.anonymize(text, locale, policy);
+  const observer =
+    collector === undefined
+      ? undefined
+      : {
+          includeOriginal: collector.includeOriginal,
+          onEntity(entity: ObservedEntity) {
+            collector.hits.push({
+              type: entity.type,
+              detector: entity.recognizer ?? "unknown",
+              placeholder: entity.replaced,
+              length: entity.end - entity.start,
+              start: entity.start,
+              end: entity.end,
+              ...(entity.original === undefined ? {} : { original: entity.original }),
+            });
+          },
+        };
+  const result = await session.anonymize(
+    text,
+    locale,
+    policy,
+    observer,
+    budget === undefined
+      ? undefined
+      : {
+          ...(budget.deadline === undefined ? {} : { deadline: budget.deadline }),
+          ...(budget.signal === undefined ? {} : { signal: budget.signal }),
+        },
+  );
+  // 任一字段降级，整条事件都标记为不完整
+  if (result.integrity !== undefined) stats.integrity = result.integrity;
+  if (result.detectionErrors !== undefined && result.detectionErrors.length > 0) {
+    const seen = new Set(
+      (stats.detectionErrors ?? []).map((entry) => `${entry.finder}:${entry.code}`),
+    );
+    for (const entry of result.detectionErrors) {
+      const key = `${entry.finder}:${entry.code}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        (stats.detectionErrors ??= []).push(entry);
+      }
+    }
+  }
   if (result.stats.totalEntities > 0) {
     stats.count += result.stats.totalEntities;
     for (const [type, count] of Object.entries(result.stats.countsByType)) {
@@ -142,15 +247,17 @@ async function scrubValue(
   session: AnonymizerSessionImpl,
   basePolicy: Partial<AnonymizationPolicy> | undefined,
   locale: string | undefined,
-  stats: { count: number; byType: Record<string, number> },
+  stats: ScrubAccumulator,
+  collector?: Collector,
+  budget?: ScrubBudget,
 ): Promise<unknown> {
   if (typeof value === "string") {
-    return scrubString(value, session, basePolicy, locale, stats);
+    return scrubString(value, session, basePolicy, locale, stats, collector, budget);
   }
   if (Array.isArray(value)) {
     const out: unknown[] = [];
     for (const item of value) {
-      out.push(await scrubValue(item, session, basePolicy, locale, stats));
+      out.push(await scrubValue(item, session, basePolicy, locale, stats, collector, budget));
     }
     return out;
   }
@@ -158,7 +265,7 @@ async function scrubValue(
     const source = value as Record<string, unknown>;
     const out: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(source)) {
-      out[key] = await scrubValue(item, session, basePolicy, locale, stats);
+      out[key] = await scrubValue(item, session, basePolicy, locale, stats, collector, budget);
     }
     return out;
   }
@@ -171,7 +278,9 @@ async function scrubPart(
   session: AnonymizerSessionImpl,
   host: ScrubHost,
   options: ScrubCoreOptions,
-  stats: { count: number; byType: Record<string, number> },
+  stats: ScrubAccumulator,
+  collector?: Collector,
+  budget?: ScrubBudget,
 ): Promise<void> {
   // V1 part state 兼容。
   const partState = part.state;
@@ -187,6 +296,8 @@ async function scrubPart(
         options.policy,
         options.locale,
         stats,
+        collector,
+        budget,
       );
     }
     if (typeof partState.error === "string") {
@@ -196,6 +307,8 @@ async function scrubPart(
         options.policy,
         options.locale,
         stats,
+        collector,
+        budget,
       );
     }
     if (
@@ -212,6 +325,8 @@ async function scrubPart(
         policy,
         options.locale,
         stats,
+        collector,
+        budget,
       );
     }
   }
@@ -228,6 +343,8 @@ async function scrubPart(
       options.policy,
       options.locale,
       stats,
+      collector,
+      budget,
     );
   }
 
@@ -243,6 +360,8 @@ async function scrubPart(
       policy,
       options.locale,
       stats,
+      collector,
+      budget,
     );
   }
 
@@ -254,6 +373,8 @@ async function scrubPart(
       options.policy,
       options.locale,
       stats,
+      collector,
+      budget,
     );
   }
 }
@@ -317,23 +438,37 @@ export async function scrubCore(
   session: AnonymizerSessionImpl,
   host: ScrubHost,
   options: ScrubCoreOptions,
+  collect?: ScrubCollectOptions,
 ): Promise<ScrubCoreStats> {
   const workingMessages = messages.map((m) => deepClone(m));
-  const stats = { count: 0, byType: {} as Record<string, number> };
+  const stats: ScrubAccumulator = { count: 0, byType: {} };
+  const budget: ScrubBudget = {
+    ...(options.deadlineMs === undefined
+      ? {}
+      : { deadline: Date.now() + options.deadlineMs }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  };
+  const collector: Collector | undefined =
+    collect === undefined
+      ? undefined
+      : { hits: [], includeOriginal: collect.includeOriginal };
+  // restoreParts 会把脱敏结果写回 messages，采集对照前先留快照
+  const originalSnapshot =
+    collect === undefined ? undefined : messages.map((m) => deepClone(m));
 
   for (const message of workingMessages) {
     if (message === null || typeof message !== "object") continue;
     if (Array.isArray(message.content)) {
       for (const part of message.content) {
         if (part !== null && typeof part === "object") {
-          await scrubPart(part, session, host, options, stats);
+          await scrubPart(part, session, host, options, stats, collector, budget);
         }
       }
     }
     if (Array.isArray(message.parts)) {
       for (const part of message.parts) {
         if (part !== null && typeof part === "object") {
-          await scrubPart(part, session, host, options, stats);
+          await scrubPart(part, session, host, options, stats, collector, budget);
         }
       }
     }
@@ -361,5 +496,90 @@ export async function scrubCore(
     });
   }
 
-  return { scrubbed: stats.count, byType: stats.byType };
+  if (collector === undefined) {
+    return {
+      scrubbed: stats.count,
+      byType: stats.byType,
+      ...(stats.integrity === undefined ? {} : { integrity: stats.integrity }),
+      ...(stats.detectionErrors === undefined
+        ? {}
+        : { detectionErrors: stats.detectionErrors }),
+    };
+  }
+
+  const { comparisons, truncated } = collectComparisons(
+    originalSnapshot ?? [],
+    workingMessages,
+    collect?.includeOriginal === true,
+    collect?.maxRecordBytes ?? 256 * 1024,
+  );
+  return {
+    scrubbed: stats.count,
+    byType: stats.byType,
+    hits: collector.hits,
+    comparisons,
+    truncated,
+    ...(stats.integrity === undefined ? {} : { integrity: stats.integrity }),
+    ...(stats.detectionErrors === undefined
+      ? {}
+      : { detectionErrors: stats.detectionErrors }),
+  };
+}
+
+/**
+ * 逐字段对比原文与脱敏结果，只保留内容变化的字段。
+ *
+ * 用递归 diff 而不是在各处埋点：字段路径天然对齐，且未命中字段不会被复制。
+ */
+function collectComparisons(
+  originals: readonly ScrubMessage[],
+  scrubbed: readonly ScrubMessage[],
+  includeOriginal: boolean,
+  maxBytes: number,
+): { comparisons: ScrubComparison[]; truncated: boolean } {
+  const comparisons: ScrubComparison[] = [];
+  let used = 0;
+  let truncated = false;
+
+  const visit = (before: unknown, after: unknown, path: string): void => {
+    if (truncated) return;
+    if (typeof before === "string" && typeof after === "string") {
+      if (before === after) return;
+      if (!includeOriginal) {
+        // 不保存原文时只留占位标记，不复制文本
+        comparisons.push({ path, before: "", after: "", truncated: true });
+        return;
+      }
+      const size = before.length + after.length;
+      if (used + size > maxBytes) {
+        truncated = true;
+        return;
+      }
+      used += size;
+      comparisons.push({ path, before, after });
+      return;
+    }
+    if (Array.isArray(before) && Array.isArray(after)) {
+      const length = Math.min(before.length, after.length);
+      for (let i = 0; i < length; i += 1) {
+        visit(before[i], after[i], `${path}[${i}]`);
+      }
+      return;
+    }
+    if (before !== null && after !== null && typeof before === "object" && typeof after === "object") {
+      for (const key of Object.keys(before as Record<string, unknown>)) {
+        visit(
+          (before as Record<string, unknown>)[key],
+          (after as Record<string, unknown>)[key],
+          path === "" ? key : `${path}.${key}`,
+        );
+      }
+    }
+  };
+
+  originals.forEach((message, index) => {
+    visit(message, scrubbed[index], `messages[${index}]`);
+  });
+
+  return { comparisons, truncated };
 }

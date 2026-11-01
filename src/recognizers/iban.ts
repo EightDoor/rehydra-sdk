@@ -26,6 +26,7 @@ const IBAN_PATTERN_WITH_SEPARATORS =
 export const ibanRecognizer: Recognizer = {
   type: PIIType.IBAN,
   name: 'IBAN',
+  id: 'iban',
   defaultConfidence: 0.99, // High confidence when checksum passes
 
   find(text: string): SpanMatch[] {

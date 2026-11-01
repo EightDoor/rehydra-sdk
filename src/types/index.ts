@@ -145,7 +145,13 @@ export interface DetectedEntity {
   /** Original text (only stored in encrypted pii_map, never logged) */
   original: string;
   /** Semantic attributes for MT-friendly tags (gender, scope, etc.) */
+  /** Semantic attributes for MT-friendly tags (gender, scope, etc.) */
   semantic?: SemanticAttributes;
+  /**
+   * 稳定识别器标识（如 `email`、`inference-server`），用于归因到具体检测器。
+   * 可选：缺失时记录层显示为 `unknown`。
+   */
+  recognizer?: string;
 }
 
 /**
@@ -165,7 +171,13 @@ export interface SpanMatch {
   /** The matched text */
   text: string;
   /** Semantic attributes for MT-friendly tags (gender, scope, etc.) */
+  /** Semantic attributes for MT-friendly tags (gender, scope, etc.) */
   semantic?: SemanticAttributes;
+  /**
+   * 稳定识别器标识（如 `email`、`inference-server`），用于归因到具体检测器。
+   * 可选：缺失时记录层显示为 `unknown`。
+   */
+  recognizer?: string;
 }
 
 /**
@@ -273,6 +285,12 @@ export interface AnonymizationResult {
   piiMap?: EncryptedPIIMap;
   /** Statistics about the anonymization */
   stats: AnonymizationStats;
+  /**
+   * 检测错误（如模型不可用）。只在降级继续时出现；`block` 策略下直接抛错。
+   */
+  detectionErrors?: Array<{ finder: "model"; code: string }>;
+  /** 检测完整性：`rules-only` 表示模型检测被跳过。 */
+  integrity?: "complete" | "rules-only";
 }
 
 /**

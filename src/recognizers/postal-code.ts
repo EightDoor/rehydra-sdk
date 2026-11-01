@@ -47,6 +47,7 @@ export function normalizeUKPostalCode(postalCode: string): string {
 export const ukPostalCodeRecognizer = createRegexRecognizer({
   type: PIIType.POSTAL_CODE,
   name: 'UK Postal Code',
+  id: 'postal-code',
   patterns: [UK_POSTAL_CODE_PATTERN],
   defaultConfidence: 0.95,
   validate: isValidUKPostalCode,

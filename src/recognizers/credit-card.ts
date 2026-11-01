@@ -47,6 +47,7 @@ type CardType = keyof typeof CARD_PATTERNS;
 export const creditCardRecognizer: Recognizer = {
   type: PIIType.CREDIT_CARD,
   name: 'Credit Card Number',
+  id: 'credit-card',
   defaultConfidence: 0.98,
 
   find(text: string): SpanMatch[] {

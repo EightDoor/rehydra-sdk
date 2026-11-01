@@ -29,6 +29,7 @@ import { isCredentialField } from "../recognizers/secrets/key-patterns.js";
 
 import {
   type INERModel,
+  type NERPrediction,
   NERModelStub,
   createNERModel,
   createInferenceServerNERModel,
@@ -42,9 +43,12 @@ import {
   type DownloadProgressCallback,
 } from "../ner/model-manager.js";
 
-import { prenormalize } from "../pipeline/prenormalize.js";
+import { createLineEndingMapping, prenormalize } from "../pipeline/prenormalize.js";
+import type { AnonymizeRun, ObservedEntity, PiiObserver } from "./observer.js";
+export type { AnonymizeRun, ObservedEntity, PiiObserver } from "./observer.js";
 import { resolveEntities } from "../pipeline/resolver.js";
 import {
+  generateTag,
   tagEntities,
   countEntitiesByType,
   type RawPIIMap,
@@ -113,6 +117,72 @@ function mergePolicyWithBase(
     excludeLocationScopes:
       partial.excludeLocationScopes ?? base.excludeLocationScopes,
   };
+}
+
+/** 把取消信号转成标准 AbortError。 */
+function toAbortError(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  if (reason instanceof Error) return reason;
+  const error = new Error("Anonymization aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+/** 给等待加一个上限；超时抛出可归类为 model-deadline 的错误。 */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("inference deadline exceeded while waiting"));
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** 把模型失败归类成不含正文的错误码。 */
+function classifyNerError(error: unknown): string {
+  const message = error instanceof Error ? error.message.toLowerCase() : "";
+  if (message.includes("deadline exceeded")) return "model-deadline";
+  if (message.includes("timed out") || message.includes("timeout")) return "model-timeout";
+  if (message.includes("failed to connect") || message.includes("econnrefused")) {
+    return "model-unreachable";
+  }
+  if (message.includes("not loaded")) return "model-unavailable";
+  return "model-failed";
+}
+
+/** 把命中回调给观察者；偏移从规范化文本折回原文空间。 */
+function notifyObserver(
+  observer: PiiObserver,
+  input: {
+    text: string;
+    normalizedText: string;
+    entities: DetectedEntity[];
+    tagFormat: TagFormat;
+  },
+): void {
+  const mapping = createLineEndingMapping(input.text);
+  for (const entity of input.entities) {
+    const hit: ObservedEntity = {
+      type: entity.type,
+      recognizer: entity.recognizer,
+      start: mapping.toOriginal(entity.start),
+      end: mapping.toOriginal(entity.end),
+      replaced: generateTag(entity.type, entity.id, entity.semantic, input.tagFormat),
+    };
+    if (observer.includeOriginal === true) {
+      hit.original = input.normalizedText.slice(entity.start, entity.end);
+    }
+    observer.onEntity(hit);
+  }
 }
 
 /**
@@ -266,6 +336,12 @@ export interface AnonymizerConfig {
    */
   secrets?: SecretsConfig;
 
+  /**
+   * 模型检测失败时的处理。`rules` 降级为规则并标记检测不完整；
+   * `block` 直接把错误抛给调用方（fail-closed）。未配置时保持原有抛错行为。
+   */
+  nerFailure?: "rules" | "block";
+
   /** Key provider for encryption (generates random key if not provided) */
   keyProvider?: KeyProvider;
 
@@ -319,6 +395,7 @@ export class Anonymizer {
   private registry: RecognizerRegistry;
   private nerModel: INERModel | null = null;
   private nerConfig: NERConfig;
+  private nerFailure: "rules" | "block" | "propagate";
   private semanticConfig: SemanticConfig;
   private secretsConfig: SecretsConfig;
   private mode: AnonymizationMode;
@@ -353,6 +430,7 @@ export class Anonymizer {
 
     // Handle NER configuration
     this.nerConfig = config.ner ?? { mode: "disabled" };
+    this.nerFailure = config.nerFailure ?? "propagate";
     this.modelVersion = config.modelVersion ?? "1.0.0";
 
     // Merge NER thresholds into default policy if provided
@@ -598,10 +676,17 @@ export class Anonymizer {
     text: string,
     locale?: string,
     policy?: Partial<AnonymizationPolicy>,
-    existingPiiMap?: RawPIIMap
+    existingPiiMap?: RawPIIMap,
+    observer?: PiiObserver,
+    run?: AnonymizeRun
   ): Promise<AnonymizationResult> {
     if (!this.initialized) {
       await this.initialize();
+    }
+
+    // 宿主取消：直接结束，不进入降级路径
+    if (run?.signal?.aborted === true) {
+      throw toAbortError(run.signal);
     }
 
     const startTime = performance.now();
@@ -620,11 +705,36 @@ export class Anonymizer {
     // Step 2: Run regex recognizers
     const regexMatches = this.registry.findAll(normalizedText, effectivePolicy);
 
-    // Step 3: Run NER model
-    const nerResult = await this.nerModel!.predict(
-      normalizedText,
-      effectivePolicy
-    );
+    // Step 3: Run NER model；失败按 nerFailure 策略处理
+    const detectionErrors: Array<{ finder: "model"; code: string }> = [];
+    let nerResult: NERPrediction;
+    const remaining =
+      run?.deadline === undefined ? undefined : run.deadline - Date.now();
+    try {
+      if (remaining !== undefined && remaining <= 0) {
+        // 预算已耗尽：不再发请求，直接走规则
+        throw new Error("inference deadline exceeded before request");
+      }
+      const prediction = this.nerModel!.predict(normalizedText, effectivePolicy);
+      // shortcut: 预算只截断等待，底层请求仍会在自身超时后结束
+      nerResult =
+        remaining === undefined
+          ? await prediction
+          : await withTimeout(prediction, remaining);
+    } catch (error) {
+      if (this.nerFailure === "block" || this.nerFailure === "propagate") {
+        throw error;
+      }
+      // 降级：本次只用规则结果，并标记检测不完整
+      detectionErrors.push({ finder: "model", code: classifyNerError(error) });
+      nerResult = {
+        spans: [],
+        processingTimeMs: 0,
+        modelVersion: this.modelVersion,
+        truncated: false,
+        coverageChars: 0,
+      };
+    }
     const nerMatches = nerResult.spans;
 
     // Step 4: Resolve and merge entities
@@ -695,6 +805,17 @@ export class Anonymizer {
       this.onValidationWarning(safeErrors);
     }
 
+    // Step 6.5: 把每条替换回调给可选的观察者（诊断/记录用）。
+    // 只在调用方显式注册时执行；命中偏移折回原始文本空间。
+    if (observer !== undefined && entities.length > 0) {
+      notifyObserver(observer, {
+        text,
+        normalizedText,
+        entities,
+        tagFormat: this.tagFormat,
+      });
+    }
+
     // Step 7: Build stats
     const endTime = performance.now();
     const stats: AnonymizationStats = {
@@ -708,6 +829,9 @@ export class Anonymizer {
       nerCoverageChars: nerResult.coverageChars,
     };
 
+    const integrity: "complete" | "rules-only" =
+      detectionErrors.length === 0 ? "complete" : "rules-only";
+
     // Step 8: Build result (without original text in entities)
     const safeEntities: Omit<DetectedEntity, "original">[] = entities.map(
       ({ original: _original, ...rest }) => rest
@@ -720,6 +844,9 @@ export class Anonymizer {
         anonymizedText,
         entities: safeEntities,
         stats,
+        ...(detectionErrors.length === 0
+          ? {}
+          : { detectionErrors, integrity }),
       };
     }
 
@@ -736,6 +863,7 @@ export class Anonymizer {
       entities: safeEntities,
       piiMap: encryptedPiiMap,
       stats,
+      ...(detectionErrors.length === 0 ? {} : { detectionErrors, integrity }),
     };
   }
 

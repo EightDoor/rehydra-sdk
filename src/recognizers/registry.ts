@@ -100,11 +100,14 @@ export class RecognizerRegistry {
         // Filter by confidence threshold
         for (const match of typeMatches) {
           if (match.confidence >= threshold) {
-            matches.push(match);
+            // 归因到具体检测器：优先用识别器给出的稳定标识
+            const detectorId = match.recognizer ?? recognizer.id ?? recognizer.name;
+            matches.push({ ...match, recognizer: detectorId });
           }
         }
       }
     }
+
 
     return matches;
   }

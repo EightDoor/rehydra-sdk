@@ -9,6 +9,7 @@ import { PIIType } from "../../types/index.js";
 export const apiKeyRecognizer = createRegexRecognizer({
   type: PIIType.API_KEY,
   name: "API Key",
+  id: 'api-key',
   defaultConfidence: 0.97,
   patterns: [
     // OpenAI

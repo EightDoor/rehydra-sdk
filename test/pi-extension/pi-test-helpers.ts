@@ -27,6 +27,8 @@ export interface MockPiContext {
   commands: string[];
   /** UI 收到的通知文本。 */
   notifications: string[];
+  /** UI 收到的确认请求。 */
+  confirmations: string[];
   /** 已注册命令的 handler。 */
   commandHandlers: Map<
     string,
@@ -41,6 +43,13 @@ export interface MockPiOptions {
   envFiles?: string[];
   vcsIdentities?: boolean;
   allowLiteralTagsIn?: string[];
+  record?: {
+    enabled?: boolean;
+    includeOriginal?: boolean;
+    dir?: string;
+  };
+  /** ui.confirm 的桩返回值。 */
+  confirmAnswer?: boolean;
 }
 
 /**
@@ -52,6 +61,7 @@ export function createMockPiContext(options: MockPiOptions = {}): MockPiContext 
   const handlers: RecordedHandler[] = [];
   const commands: string[] = [];
   const notifications: string[] = [];
+  const confirmations: string[] = [];
   const commandHandlers = new Map<
     string,
     (args: string, ctx: ExtensionContext) => unknown
@@ -67,6 +77,10 @@ export function createMockPiContext(options: MockPiOptions = {}): MockPiContext 
   const ui = {
     notify: (message: string) => {
       notifications.push(message);
+    },
+    confirm: async (message: string) => {
+      confirmations.push(message);
+      return options.confirmAnswer ?? false;
     },
     select: async () => undefined,
     custom: async () => undefined,
@@ -113,7 +127,8 @@ export function createMockPiContext(options: MockPiOptions = {}): MockPiContext 
         options.redactValues !== undefined ||
         options.envFiles !== undefined ||
         options.vcsIdentities !== undefined ||
-        options.allowLiteralTagsIn !== undefined;
+        options.allowLiteralTagsIn !== undefined ||
+        options.record !== undefined;
       if (needsOptions) {
         settings.rehydra = {
           ...(options.redactValues !== undefined
@@ -126,6 +141,7 @@ export function createMockPiContext(options: MockPiOptions = {}): MockPiContext 
           ...(options.vcsIdentities !== undefined
             ? { vcsIdentities: options.vcsIdentities }
             : {}),
+          ...(options.record !== undefined ? { record: options.record } : {}),
         };
       }
       return settings as unknown;
@@ -147,6 +163,7 @@ export function createMockPiContext(options: MockPiOptions = {}): MockPiContext 
     api,
     commands,
     notifications,
+    confirmations,
     commandHandlers,
   };
 }

@@ -54,6 +54,7 @@ const INTERNAL_IPV4_RANGES = [
 export const ipAddressRecognizer: Recognizer = {
   type: PIIType.IP_ADDRESS,
   name: 'IP Address',
+  id: 'ip-address',
   defaultConfidence: 0.9,
 
   find(text: string): SpanMatch[] {

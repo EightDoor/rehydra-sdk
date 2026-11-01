@@ -81,6 +81,7 @@ function hasBankContext(text: string, start: number): boolean {
 export const bicSwiftRecognizer: Recognizer = {
   type: PIIType.BIC_SWIFT,
   name: 'BIC/SWIFT Code',
+  id: 'bic-swift',
   defaultConfidence: 0.95,
 
   find(text: string): SpanMatch[] {

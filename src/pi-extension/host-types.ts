@@ -25,9 +25,11 @@ export interface ExtensionSessionManager {
   [key: string]: unknown;
 }
 
-/** 终端 UI：本扩展只用 notify 输出状态。 */
+/** 终端 UI：notify 输出状态；confirm 用于需要确认的破坏性操作。 */
 export interface ExtensionUi {
   notify(message: string, level?: string): void;
+  /** 可选：宿主支持时用于二次确认；不支持时返回 undefined。 */
+  confirm?(message: string): Promise<boolean> | boolean;
   [key: string]: unknown;
 }
 
@@ -38,6 +40,8 @@ export interface ExtensionContext {
   mode: string;
   hasUI: boolean;
   sessionManager: ExtensionSessionManager;
+  /** 宿主取消信号；不支持时为 undefined。 */
+  signal?: AbortSignal;
   [key: string]: unknown;
 }
 

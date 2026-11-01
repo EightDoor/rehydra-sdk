@@ -21,6 +21,7 @@ const EMAIL_PATTERN = /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9
 export const emailRecognizer: Recognizer = {
   type: PIIType.EMAIL,
   name: 'Email Address',
+  id: 'email',
   defaultConfidence: 0.98,
 
   find(text: string): SpanMatch[] {

@@ -48,6 +48,27 @@ Pi 会在 `~/.pi/agent/settings.json` 写入包声明。然后编辑该文件添
 | `message_end` | 改写最终回答的文本块，把 PII 标签还原为真实值 |
 | `session_shutdown` | 释放匿名器与会话注册表 |
 
+## 脱敏记录与对照
+
+开启后可以逐请求核对"哪些内容被拦截、模型实际收到了什么"：
+
+```json
+{
+  "rehydra": {
+    "record": {
+      "enabled": true,
+      "includeOriginal": true
+    }
+  }
+}
+```
+
+`/rehydra log` 列出当前会话最近 20 条记录，`/rehydra log <id>` 看单条详情（命中行 + 字段级 before/after），`/rehydra log --type EMAIL` 按类型筛选；`/rehydra clear` 清当前会话，`/rehydra clear --all` 清全部（都要确认）。
+
+记录默认关闭。开启后写入 `~/.pi/agent/rehydra/records/`（目录 0700、文件 0600），按 7 天与 32 MiB 双上限裁剪，单条记录对照上限 256 KiB。**`includeOriginal` 为 true 时真实值会写到本地磁盘**；不需要时设成 `false`，记录只保留类型、检测器、占位符、长度与偏移。记录里出现的终端控制字符在展示时会转义，原文不会回填到模型上下文。
+
+记录层任何失败（目录不可写、符号链接、半行文件）都只告警，不影响脱敏与请求。
+
 ## 限制
 - 工具入参还原是严格的：标签不在本次会话映射中（或映射缺失、解密失败）时，该次工具调用会被阻止，不会把 `<PII .../>` 当作真实值执行。占位符只能由同一条会话的映射还原；默认使用内存映射，进程重启后旧标签无法还原。
 

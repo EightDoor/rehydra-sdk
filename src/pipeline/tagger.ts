@@ -322,6 +322,7 @@ export function tagEntities(
     source: e.source,
     original: e.text,
     semantic: e.semantic,
+    recognizer: e.recognizer,
   }));
 
   return {

@@ -19,6 +19,7 @@ import type {
   PIIStorageProvider,
   StoredPIIMap,
 } from "./types.js";
+import type { AnonymizeRun, PiiObserver } from "../core/observer.js";
 
 /**
  * Interface for the parent Anonymizer (to avoid circular dependency)
@@ -28,7 +29,9 @@ export interface IAnonymizer {
     text: string,
     locale?: string,
     policy?: Partial<AnonymizationPolicy>,
-    existingPiiMap?: RawPIIMap
+    existingPiiMap?: RawPIIMap,
+    observer?: PiiObserver,
+    run?: AnonymizeRun
   ): Promise<AnonymizationResult>;
   readonly resolvedTagFormat: TagFormat;
 }
@@ -51,7 +54,9 @@ export class AnonymizerSessionImpl implements AnonymizerSession {
   async anonymize(
     text: string,
     locale?: string,
-    policy?: Partial<AnonymizationPolicy>
+    policy?: Partial<AnonymizationPolicy>,
+    observer?: PiiObserver,
+    run?: AnonymizeRun
   ): Promise<AnonymizationResult> {
     // Get the encryption key
     const key = await this.keyProvider.getKey();
@@ -97,7 +102,9 @@ export class AnonymizerSessionImpl implements AnonymizerSession {
       text,
       locale,
       policy,
-      existingPiiMap
+      existingPiiMap,
+      observer,
+      run
     );
 
     // Sessions require a PII map (only available in pseudonymize mode)

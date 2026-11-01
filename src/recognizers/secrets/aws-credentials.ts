@@ -15,6 +15,7 @@ const AWS_SECRET_KEY_PATTERN = /\b[A-Za-z0-9/+=]{40}\b/g;
 export const awsCredentialsRecognizer: Recognizer = {
   type: PIIType.AWS_CREDENTIALS,
   name: "AWS Credentials",
+  id: 'aws-credentials',
   defaultConfidence: 0.98,
 
   find(text: string): SpanMatch[] {

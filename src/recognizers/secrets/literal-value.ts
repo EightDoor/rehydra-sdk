@@ -32,6 +32,7 @@ export function createLiteralValueRecognizer(
   return {
     type: PIIType.ENV_VAR_SECRET,
     name: "Literal Secret Value",
+    id: "known-value",
     defaultConfidence: 1.0,
 
     find(text: string): SpanMatch[] {

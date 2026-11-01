@@ -46,10 +46,13 @@ export class InferenceServerNERModel implements INERModel {
   private config: InferenceServerNERModelConfig;
   private isLoaded = false;
   readonly version: string;
+  /** 归因标识：记录里用它区分模型命中与规则命中。 */
+  readonly recognizerId: string;
 
   constructor(config: InferenceServerNERModelConfig) {
     this.config = config;
     this.version = config.modelVersion ?? "2.0.0";
+    this.recognizerId = `ner:${this.version}`;
     this.client = new InferenceServerClient({
       url: config.serverUrl,
       timeout: config.timeout,
@@ -92,7 +95,7 @@ export class InferenceServerNERModel implements INERModel {
     const minConfidence = this.getMinConfidence(policy);
     const result = await this.client.predict(text, minConfidence);
 
-    let spans = this.convertToSpanMatches(result.entities);
+    let spans = this.convertToSpanMatches(result.entities, text);
 
     // Apply policy filtering
     if (policy !== undefined) {
@@ -114,12 +117,26 @@ export class InferenceServerNERModel implements INERModel {
     };
   }
 
-  private convertToSpanMatches(entities: ServerEntityMatch[]): SpanMatch[] {
+  private convertToSpanMatches(entities: ServerEntityMatch[], text: string): SpanMatch[] {
     const spans: SpanMatch[] = [];
-    
+
     for (const entity of entities) {
       const piiType = SERVER_TYPE_TO_PII_TYPE[entity.type.toUpperCase()];
       if (piiType === undefined) continue;
+      // 校验跨度与置信度：协议不一致时宁可丢弃，也不能错位替换
+      if (
+        typeof entity.confidence !== "number" ||
+        entity.confidence < 0 ||
+        entity.confidence > 1 ||
+        !Number.isInteger(entity.start) ||
+        !Number.isInteger(entity.end) ||
+        entity.start < 0 ||
+        entity.end <= entity.start ||
+        entity.end > text.length
+      ) {
+        continue;
+      }
+      if (text.slice(entity.start, entity.end) !== entity.text) continue;
       
       spans.push({
         type: piiType,
@@ -128,6 +145,7 @@ export class InferenceServerNERModel implements INERModel {
         confidence: entity.confidence,
         source: DetectionSource.NER,
         text: entity.text,
+        recognizer: this.recognizerId,
       });
     }
     

@@ -131,6 +131,7 @@ function validateNumericGroups(
 export const dateRecognizer: Recognizer = {
   type: PIIType.DATE,
   name: 'Date',
+  id: 'date',
   defaultConfidence: 0.9,
 
   find(text: string): SpanMatch[] {

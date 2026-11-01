@@ -17,6 +17,7 @@ const POSTAL_TAIL = String.raw`(?:${SEPARATOR}(?:${LOCALITY}${SEPARATOR}){0,3}${
 export const streetAddressRecognizer = createRegexRecognizer({
   type: PIIType.ADDRESS,
   name: 'Numbered Street Address',
+  id: 'address',
   patterns: [new RegExp(String.raw`(?<![\p{L}\p{N}])${UNIT}${STREET}${POSTAL_TAIL}`, 'giu')],
   defaultConfidence: 0.95,
   // Travel directions describe distances rather than a street number.

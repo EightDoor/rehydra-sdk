@@ -48,6 +48,27 @@ Every key under `rehydra` is an extension option: `envFiles`, `redactValues`, `m
 | `message_end` | Rewrite the final assistant message so PII tags are replaced with real values |
 | `session_shutdown` | Dispose of the anonymizer and session registry |
 
+## Masking records and comparison
+
+Once enabled, you can check request by request what was intercepted and what the model actually received:
+
+```json
+{
+  "rehydra": {
+    "record": {
+      "enabled": true,
+      "includeOriginal": true
+    }
+  }
+}
+```
+
+`/rehydra log` lists the last 20 records for the current session, `/rehydra log <id>` shows one record (hit lines plus field-level before/after), `/rehydra log --type EMAIL` filters by type; `/rehydra clear` clears the current session and `/rehydra clear --all` clears everything (both ask for confirmation).
+
+Recording is off by default. When enabled it writes to `~/.pi/agent/rehydra/records/` (directory 0700, files 0600), trimmed by both a 7-day and a 32 MiB cap, with 256 KiB per record for comparisons. **With `includeOriginal` set to true, real values are written to local disk**; set it to false to keep only the type, detector, placeholder, length and offsets. Terminal control characters are escaped when displayed, and record text is never fed back into model context.
+
+Any recording failure (unwritable directory, symlink, half-written line) only produces a warning and never affects masking or the request.
+
 ## Limitations
 - Tool-argument rehydration is strict: when a tag is absent from this session's map (or the map is missing, or decryption fails), the tool call is blocked rather than run with `<PII .../>` as a real value. A placeholder can only be restored from the same session's map; the default map is in memory, so tags from before a process restart cannot be restored.
 

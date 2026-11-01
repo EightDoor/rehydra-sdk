@@ -97,6 +97,20 @@ NER 推理通过 ONNX Runtime 在本地执行（量化模型约 280 MB）。不�
 
 `policy` 里的集合类字段可以写成数组、阈值写成对象（程序化调用也可用 `Set` / `Map`）；字段类型不合法时启动会报错并指出字段名，不会静默丢掉保护规则。
 
+## 请求级脱敏记录
+
+Pi 扩展支持逐请求记录脱敏结果，便于核对误遮蔽：
+
+```json
+{
+  "rehydra": {
+    "record": { "enabled": true, "includeOriginal": true }
+  }
+}
+```
+
+`/rehydra log` 看当前会话最近记录，`/rehydra log <id>` 看命中与字段级 before/after 对照，`/rehydra clear --all` 清空。记录默认关闭；开启后写入 `~/.pi/agent/rehydra/records/`（0700 / 0600），按天与总量裁剪。`includeOriginal: false` 时只保留类型、检测器、占位符与偏移，不写原值。
+
 ## 地址识别说明
 
 默认正则注册表检测英国邮编语法和带门牌号的英文街道地址，例如 `34a Friskin Road`。当公寓标识与街道地址相邻时会被包含，例如 `Flat 1\n34a Friskin Road`。以邮编结尾的连续英国地址块会被整体遮盖为一个 `ADDRESS`；独立的邮编使用 `POSTAL_CODE`。裸公寓号、无门牌号的建筑以及其他国家的邮编格式需要自定义识别器或 NER。邮编匹配只检查语法，不验证该邮编当前是否仍在使用。

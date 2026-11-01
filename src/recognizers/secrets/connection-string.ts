@@ -14,6 +14,7 @@ const PLACEHOLDER_PASSWORDS = new Set([
 export const connectionStringRecognizer = createRegexRecognizer({
   type: PIIType.CONNECTION_STRING,
   name: "Connection String",
+  id: 'connection-string',
   defaultConfidence: 0.93,
   patterns: [
     // postgres://user:password@host/db

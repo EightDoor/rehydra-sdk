@@ -51,6 +51,7 @@ const MAX_DIGITS = 15;
 export const phoneRecognizer: Recognizer = {
   type: PIIType.PHONE,
   name: 'Phone Number',
+  id: 'phone',
   defaultConfidence: 0.9,
 
   find(text: string): SpanMatch[] {

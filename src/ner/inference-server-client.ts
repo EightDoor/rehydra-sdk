@@ -67,6 +67,12 @@ export class InferenceServerClient {
   constructor(config: InferenceServerConfig) {
     this.url = config.url.replace(/\/$/, "");
     this.timeout = config.timeout ?? 30000;
+    // 非回环地址必须走 HTTPS：待检测原文会离开本机
+    if (!isLoopback(this.url) && !this.url.startsWith("https://")) {
+      throw new Error(
+        `Inference server must use https for non-loopback address: ${this.url}`,
+      );
+    }
   }
 
   /**
@@ -91,11 +97,13 @@ export class InferenceServerClient {
           confidence_threshold: confidenceThreshold,
         }),
         signal: controller.signal,
+        // 不跟随重定向：避免把原文再发给另一个主机
+        redirect: "error",
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Server error (${response.status}): ${errorText}`);
+        // 不回显响应正文：里面可能含服务端回显的原文
+        throw new Error(`Inference server responded with status ${response.status}`);
       }
 
       const data = (await response.json()) as PredictResponse;
@@ -166,6 +174,16 @@ export class InferenceServerClient {
     }
 
     throw new Error(`Server not ready within ${maxWaitMs}ms`);
+  }
+}
+
+/** 判断 URL 是否指向本机。 */
+function isLoopback(url: string): boolean {
+  try {
+    const host = new URL(url).hostname;
+    return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+  } catch {
+    return false;
   }
 }
 

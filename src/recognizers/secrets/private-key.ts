@@ -9,6 +9,7 @@ import { PIIType } from "../../types/index.js";
 export const privateKeyRecognizer = createRegexRecognizer({
   type: PIIType.PRIVATE_KEY,
   name: "Private Key",
+  id: 'private-key',
   defaultConfidence: 0.99,
   patterns: [
     // Full PEM block (multiline)

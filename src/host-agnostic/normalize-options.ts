@@ -53,7 +53,32 @@ export interface RehydraSharedOptions {
   policy?: Partial<AnonymizationPolicy> | PolicyInputShape;
   /** `undefined` 表示用户没有显式配置；空对象 `{}` 也视为显式配置。 */
   anonymizer?: AnonymizerConfig;
+  /** 脱敏记录配置。 */
+  record?: RecordOptions;
+  /** 模型检测不可用时的处理。 */
+  nerFailure?: "rules" | "block";
 }
+
+/** 脱敏记录配置（已校验）。 */
+export interface RecordOptions {
+  enabled: boolean;
+  includeOriginal: boolean;
+  keepInMemory: number;
+  keepDays: number;
+  keepBytes: number;
+  maxRecordBytes: number;
+  /** 记录目录；未配置时由扩展按 cwd 解析。 */
+  dir?: string;
+}
+
+export const DEFAULT_RECORD_OPTIONS: Omit<RecordOptions, "dir"> = {
+  enabled: false,
+  includeOriginal: false,
+  keepInMemory: 50,
+  keepDays: 7,
+  keepBytes: 32 * 1024 * 1024,
+  maxRecordBytes: 256 * 1024,
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -70,6 +95,26 @@ function asPIITypeNames(value: unknown): PIITypeName[] | undefined {
   return value.filter(
     (item): item is PIITypeName => typeof item === "string" && known.has(item),
   );
+}
+
+/** 记录选项：未知字段忽略，畸形值回落默认。 */
+function asRecordOptions(value: unknown): RecordOptions | undefined {
+  if (!isRecord(value)) return undefined;
+  const positive = (raw: unknown, fallback: number): number =>
+    asPositiveInteger(raw) ?? fallback;
+  const dir = typeof value.dir === "string" && value.dir !== "" ? value.dir : undefined;
+  return {
+    enabled: typeof value.enabled === "boolean" ? value.enabled : DEFAULT_RECORD_OPTIONS.enabled,
+    includeOriginal:
+      typeof value.includeOriginal === "boolean"
+        ? value.includeOriginal
+        : DEFAULT_RECORD_OPTIONS.includeOriginal,
+    keepInMemory: positive(value.keepInMemory, DEFAULT_RECORD_OPTIONS.keepInMemory),
+    keepDays: positive(value.keepDays, DEFAULT_RECORD_OPTIONS.keepDays),
+    keepBytes: positive(value.keepBytes, DEFAULT_RECORD_OPTIONS.keepBytes),
+    maxRecordBytes: positive(value.maxRecordBytes, DEFAULT_RECORD_OPTIONS.maxRecordBytes),
+    ...(dir === undefined ? {} : { dir }),
+  };
 }
 
 function asPositiveInteger(value: unknown): number | undefined {
@@ -120,6 +165,11 @@ export function normalizeRehydraOptions(raw: unknown): RehydraSharedOptions {
   normalized.anonymizer = isRecord(source.anonymizer)
     ? (source.anonymizer as AnonymizerConfig)
     : undefined;
+  normalized.record = asRecordOptions(source.record);
+  normalized.nerFailure =
+    source.nerFailure === "block" || source.nerFailure === "rules"
+      ? source.nerFailure
+      : "rules";
 
   return normalized;
 }

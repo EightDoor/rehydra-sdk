@@ -30,6 +30,7 @@ const MAILTO_PATTERN =
 export const urlRecognizer: Recognizer = {
   type: PIIType.URL,
   name: 'URL',
+  id: 'url',
   defaultConfidence: 0.92,
 
   find(text: string): SpanMatch[] {
