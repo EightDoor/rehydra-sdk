@@ -19,11 +19,19 @@ import type {
   SecretsConfig,
   TagFormat,
 } from "../types/index.js";
+import { normalizePolicyInput, type PolicyInputShape } from "./policy-input.js";
 
 /** 字符串形式的 PII 类型名。 */
 export type PIITypeName = `${PIIType}`;
 
-export const DEFAULT_DISABLE_TYPES: PIITypeName[] = ["URL", "IP_ADDRESS"];
+// 形状级识别器在代码/文档文本里误报率高，默认关闭；用户的 disableTypes 会整体覆盖本默认值。
+export const DEFAULT_DISABLE_TYPES: PIITypeName[] = [
+  "URL",
+  "IP_ADDRESS",
+  "BIC_SWIFT",
+  "POSTAL_CODE",
+  "DATE",
+];
 export const DEFAULT_ENV_FILES: string[] = ["**/.env*"];
 export const DEFAULT_MIN_VALUE_LENGTH = 4;
 
@@ -38,7 +46,11 @@ export interface RehydraSharedOptions {
   allowLiteralTagsIn?: string[];
   locale?: string;
   tagFormat?: TagFormat;
-  policy?: Partial<AnonymizationPolicy>;
+  /**
+   * 策略覆盖。程序化调用可用 Set/Map；配置文件（JSON）里用数组与普通对象，
+   * 由 `normalizePolicyInput` 规范化。
+   */
+  policy?: Partial<AnonymizationPolicy> | PolicyInputShape;
   /** `undefined` 表示用户没有显式配置；空对象 `{}` 也视为显式配置。 */
   anonymizer?: AnonymizerConfig;
 }
@@ -102,6 +114,7 @@ export function normalizeRehydraOptions(raw: unknown): RehydraSharedOptions {
   };
 
   if (isRecord(source.policy)) {
+    // 集合类字段在这里可能还是数组/普通对象，由 policyFromOptions 规范化
     normalized.policy = source.policy as Partial<AnonymizationPolicy>;
   }
   normalized.anonymizer = isRecord(source.anonymizer)
@@ -143,13 +156,24 @@ export function anonymizerConfigFromOptions(
 }
 
 
-/** 处理 `disableTypes` 并重新打开 secret 类型。 */
+/**
+ * 处理 `disableTypes` 并重新打开 secret 类型。
+ *
+ * 用户给的 `policy` 会先规范化；无法解析时抛错并带上字段名，
+ * 不静默丢弃保护规则。
+ */
 export function policyFromOptions(
   options: RehydraSharedOptions,
 ): Partial<AnonymizationPolicy> | undefined {
   const disableTypes = options.disableTypes ?? DEFAULT_DISABLE_TYPES;
+  const normalized = normalizePolicyInput(options.policy);
+  if (!normalized.ok) {
+    throw new Error(`Invalid rehydra configuration: ${normalized.message} (${normalized.field})`);
+  }
+  const userPolicy = normalized.policy;
+
   if (disableTypes.length === 0) {
-    return options.policy;
+    return userPolicy;
   }
 
   const base = createDefaultPolicy();
@@ -165,5 +189,5 @@ export function policyFromOptions(
     nerEnabledTypes.delete(piiType);
   }
 
-  return { ...options.policy, regexEnabledTypes, nerEnabledTypes };
+  return { ...userPolicy, regexEnabledTypes, nerEnabledTypes };
 }

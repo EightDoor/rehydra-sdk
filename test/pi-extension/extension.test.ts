@@ -353,4 +353,25 @@ describe("Rehydra Pi extension", () => {
     expect(bashResult?.block).toBe(true);
     expect(bashResult?.reason).toContain("missing-pii-map");
   });
+
+  it("registers the rehydra command", () => {
+    expect(mock.commands).toContain("rehydra");
+  });
+
+  it("lists the effective regex types in the status output", async () => {
+    const startHandler = mock.handlers.find((h) => h.name === "session_start");
+    expect(startHandler).toBeDefined();
+    await startHandler!.handler({}, mock.ctx);
+
+    const command = mock.commandHandlers.get("rehydra");
+    expect(command).toBeDefined();
+    await command!("", mock.ctx);
+
+    const output = mock.notifications.join("\n");
+    expect(output).toContain("regexTypes:");
+    // 形状级类型默认关闭
+    expect(output).not.toContain("BIC_SWIFT");
+    expect(output).not.toContain("POSTAL_CODE");
+    expect(output).not.toContain("DATE,");
+  });
 });

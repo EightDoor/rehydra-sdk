@@ -83,6 +83,15 @@ describe('Literal Value Recognizer', () => {
       expect(matches).toHaveLength(2);
     });
 
+    it('should match a known value inside another word', () => {
+      const recognizer = createLiteralValueRecognizer(['my-secret-value-1234']);
+      const text = 'xmy-secret-value-1234y';
+      const matches = recognizer.find(text);
+
+      expect(matches).toHaveLength(1);
+      expect(matches[0]?.text).toBe('my-secret-value-1234');
+    });
+
     it('should return empty array for no values provided', () => {
       const recognizer = createLiteralValueRecognizer([]);
       const text = 'some text with nothing to find';

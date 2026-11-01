@@ -52,7 +52,9 @@ Every key under `rehydra` is an extension option: `envFiles`, `redactValues`, `m
 - Tool-argument rehydration is strict: when a tag is absent from this session's map (or the map is missing, or decryption fails), the tool call is blocked rather than run with `<PII .../>` as a real value. A placeholder can only be restored from the same session's map; the default map is in memory, so tags from before a process restart cannot be restored.
 
 - Model calls that bypass these hooks (rare, e.g. user-initiated notes) are not intercepted.
-- `URL` and `IP_ADDRESS` are disabled by default; re-enable with `disableTypes: []`.
+- `URL`, `IP_ADDRESS`, `BIC_SWIFT`, `POSTAL_CODE` and `DATE` are disabled by default: recognizers that fire on shape alone misfire badly in code and documents. Restore them with `disableTypes: ["URL", "IP_ADDRESS"]`; a bank identifier still needs a full banking context word nearby.
+- Only the values of sensitive fields in an `.env` file enter the global known-value set; project names and ports are not replaced later in the text. Explicitly configured `redactValues` are not affected by that filter.
+- Collection fields in `policy` may be arrays and thresholds plain objects; an invalid field type fails startup with the field name instead of silently dropping the protection rule.
 - This extension cannot guarantee that title or compaction summaries stay sanitized — disable title agents if you need titles to be human-readable.
 
 ## License

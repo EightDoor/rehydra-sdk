@@ -64,6 +64,8 @@ export const emailRecognizer: Recognizer = {
     // Local part validation
     if (local.length === 0 || local.length > 64) return false;
     if (local.startsWith('.') || local.endsWith('.')) return false;
+    // `git@host` 是 SSH 远程地址，不是邮箱
+    if (local.toLowerCase() === 'git') return false;
 
     // Domain validation
     if (domain.length === 0 || domain.length > 253) return false;

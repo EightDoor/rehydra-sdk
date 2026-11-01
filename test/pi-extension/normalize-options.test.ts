@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import {
   anonymizerConfigFromOptions,
   normalizeRehydraOptions,
+  policyFromOptions,
 } from "../../src/host-agnostic/normalize-options.js";
 
 describe("anonymizerConfigFromOptions", () => {
@@ -37,5 +38,39 @@ describe("normalizeRehydraOptions", () => {
     expect(options.minValueLength).toBe(4);
     expect(options.envFiles).toEqual(["**/.env*"]);
     expect("unknownField" in options).toBe(false);
+  });
+
+  it("keeps the default disabled types", () => {
+    const options = normalizeRehydraOptions({});
+    expect(options.disableTypes).toEqual([
+      "URL",
+      "IP_ADDRESS",
+      "BIC_SWIFT",
+      "POSTAL_CODE",
+      "DATE",
+    ]);
+  });
+
+  it("lets the user restore the shape-based types", () => {
+    const options = normalizeRehydraOptions({ disableTypes: ["URL", "IP_ADDRESS"] });
+    const policy = policyFromOptions(options);
+    expect(policy?.regexEnabledTypes?.has("BIC_SWIFT")).toBe(true);
+    expect(policy?.regexEnabledTypes?.has("DATE")).toBe(true);
+  });
+
+  it("normalizes a JSON-style policy instead of crashing on it", () => {
+    const options = normalizeRehydraOptions({
+      policy: { allowlistTerms: ["foo"], confidenceThresholds: { PERSON: 0.8 } },
+    });
+    const policy = policyFromOptions(options);
+    expect(policy?.allowlistTerms).toEqual(new Set(["foo"]));
+    expect(policy?.confidenceThresholds?.get("PERSON")).toBe(0.8);
+  });
+
+  it("reports an invalid policy field instead of dropping it", () => {
+    const options = normalizeRehydraOptions({
+      policy: { allowlistTerms: 42 },
+    });
+    expect(() => policyFromOptions(options)).toThrow(/policy\.allowlistTerms/);
   });
 });

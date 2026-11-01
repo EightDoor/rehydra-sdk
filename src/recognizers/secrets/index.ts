@@ -20,7 +20,12 @@ export { awsCredentialsRecognizer } from "./aws-credentials.js";
 export { envVarSecretRecognizer, createEnvVarSecretRecognizer } from "./env-var.js";
 export { configSecretRecognizer, createConfigSecretRecognizer } from "./config-secret.js";
 export { createLiteralValueRecognizer } from "./literal-value.js";
-export { isSecretKeyName } from "./key-patterns.js";
+export {
+  isSecretKeyName,
+  isCredentialField,
+  looksLikeCodeReference,
+  normalizeKeyName,
+} from "./key-patterns.js";
 
 /**
  * Creates all secret recognizers

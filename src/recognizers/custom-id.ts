@@ -62,8 +62,10 @@ export function createCustomIdRecognizer(patterns: CustomIdPattern[]): Recognize
  * Common patterns for banking/government IDs that can be used as templates
  */
 export const COMMON_ID_PATTERNS: Record<string, RegExp> = {
-  // German case/file reference patterns
-  germanCaseId: /\b[A-Z]{2,3}[\s-]?[0-9]{4,10}[\s-]?[A-Z0-9]{0,4}\b/g,
+  // 业务编号：必须带显式前缀词 + 分隔符 + 含数字的编号。
+  // 纯结构（如 `AB/1234`、`1234/26`）不再匹配，否则文档里的标准号、版本号会被当成业务编号。
+  germanCaseId:
+    /\b(?:AZ|AKTENZEICHEN|FALL|VORGANG|REF|GESCHÄFTSVORFALL|GESCHAEFTSVORFALL)[ \t.-]+(?=[A-Z0-9][A-Z0-9/-]{2,13})(?=[A-Z0-9/-]*\d)[A-Z0-9][A-Z0-9/-]{2,13}/gi,
 
   // Generic case number (e.g., CASE-12345).
   // 通用编号必须带显式分隔符且含数字：否则 `case`/`file`/`ref` 等语言关键字与

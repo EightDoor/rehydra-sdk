@@ -25,6 +25,7 @@ import {
   createSecretRecognizers,
 } from "../recognizers/index.js";
 import { createLiteralValueRecognizer } from "../recognizers/secrets/literal-value.js";
+import { isCredentialField } from "../recognizers/secrets/key-patterns.js";
 
 import {
   type INERModel,
@@ -539,15 +540,18 @@ export class Anonymizer {
       await loadSemanticData();
       this.semanticDataReady = true;
     }
-
     // Handle secrets .env file loading and literal value matching
     if (this.secretsConfig.enabled) {
-      const literalValues: string[] = [
-        ...(this.secretsConfig.redactValues ?? []),
-      ];
+      // 显式指定的值按用户意图保留，不做自动筛选
+      const explicitValues: string[] = [];
+      for (const value of this.secretsConfig.redactValues ?? []) {
+        if (value.trim().length === 0) continue;
+        explicitValues.push(value);
+      }
       const minLength = this.secretsConfig.minValueLength ?? 4;
 
       // Parse .env files if provided
+      const envValues: string[] = [];
       if (this.secretsConfig.envFiles !== undefined && this.secretsConfig.envFiles.length > 0) {
         const storage = await getStorageProvider();
         const envFiles = storage.resolveFiles !== undefined
@@ -557,12 +561,18 @@ export class Anonymizer {
           try {
             const content = await storage.readTextFile(envFile);
             const parsed = parseEnvFile(content);
-            literalValues.push(...parsed);
+            // 只把敏感字段的值收进已知值集合：项目名、端口这类普通配置
+            // 值一旦进入集合，后续文本里出现就会被替换。
+            for (const entry of parsed) {
+              if (isCredentialField(entry.key)) envValues.push(entry.value);
+            }
           } catch {
             // Skip files that can't be read
           }
         }
       }
+
+      const literalValues = [...explicitValues, ...envValues];
 
       // Register literal value recognizer if we have values
       if (literalValues.length > 0) {
@@ -933,10 +943,10 @@ export async function anonymizeWithNER(
 }
 
 /**
- * Parses a .env file content and returns values
+ * Parses a .env file content and returns key/value pairs.
  */
-function parseEnvFile(content: string): string[] {
-  const values: string[] = [];
+function parseEnvFile(content: string): Array<{ key: string; value: string }> {
+  const entries: Array<{ key: string; value: string }> = [];
   const lines = content.split("\n");
 
   for (const line of lines) {
@@ -946,12 +956,11 @@ function parseEnvFile(content: string): string[] {
 
     // Match KEY=VALUE (with optional export prefix and quotes)
     const match = trimmed.match(
-      /^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*["']?(.*?)["']?$/,
+      /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*["']?(.*?)["']?$/,
     );
-    if (match !== null && match[1] !== undefined && match[1] !== "") {
-      values.push(match[1]);
+    if (match !== null && match[1] !== undefined && match[2] !== undefined && match[2] !== "") {
+      entries.push({ key: match[1], value: match[2] });
     }
   }
-
-  return values;
+  return entries;
 }

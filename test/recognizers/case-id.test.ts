@@ -70,6 +70,16 @@ describe("generic CASE_ID recognizer", () => {
     expect(hits("case123456")).toEqual([]);
   });
 
+  it("detects a prefixed reference", () => {
+    expect(hits("Az. 2024/1234")).toEqual(["Az. 2024/1234"]);
+  });
+
+  it("leaves bare structured numbers alone", () => {
+    expect(hits("AB/1234")).toEqual([]);
+    expect(hits("2024/1234")).toEqual([]);
+    expect(hits("v1.2.3")).toEqual([]);
+  });
+
   it("does not match across a line break", () => {
     expect(hits("case\n123456")).toEqual([]);
   });

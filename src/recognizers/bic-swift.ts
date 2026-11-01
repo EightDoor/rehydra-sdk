@@ -48,6 +48,34 @@ const VALID_COUNTRY_CODES = new Set([
 ]);
 
 /**
+ * 银行语境词：形状合法的 8/11 位大写组合在普通文本里出现频率很高，
+ * 只有值前面出现完整语境词时才认定为银行标识码。
+ */
+const BANK_CONTEXT_TERMS = ['bic', 'swift', 'bank', 'bankleitzahl', '银行'];
+
+/** 语境窗口：命中点之前最多看这么多字符，且不跨行。 */
+const BANK_CONTEXT_WINDOW = 32;
+
+/** term 是否以完整词出现在 window 中（拉丁词要求词边界，CJK 直接包含）。 */
+function hasContextTerm(window: string, term: string): boolean {
+  if (/^[a-z]+$/.test(term)) {
+    return new RegExp(`(?:^|[^a-z])${term}(?:[^a-z]|$)`).test(window);
+  }
+  return window.includes(term);
+}
+
+/** 判断 start 之前是否有银行语境词，不跨行。 */
+function hasBankContext(text: string, start: number): boolean {
+  const windowStart = Math.max(0, start - BANK_CONTEXT_WINDOW);
+  let window = text.slice(windowStart, start);
+  // 只保留命中所在行的一部分：语境词不能来自上一行
+  const lastBreak = Math.max(window.lastIndexOf('\n'), window.lastIndexOf('\r'));
+  if (lastBreak >= 0) window = window.slice(lastBreak + 1);
+  const lowered = window.toLowerCase();
+  return BANK_CONTEXT_TERMS.some((term) => hasContextTerm(lowered, term));
+}
+
+/**
  * BIC/SWIFT code recognizer
  */
 export const bicSwiftRecognizer: Recognizer = {
@@ -66,6 +94,8 @@ export const bicSwiftRecognizer: Recognizer = {
 
       // Validate the BIC code
       if (!this.validate!(bic)) continue;
+      // 形状合法还不够：必须有银行语境词，否则普通大写常量会被误判
+      if (!hasBankContext(text, match.index)) continue;
 
       matches.push({
         type: PIIType.BIC_SWIFT,

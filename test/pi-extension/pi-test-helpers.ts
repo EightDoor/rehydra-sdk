@@ -23,6 +23,15 @@ export interface MockPiContext {
   handlers: RecordedHandler[];
   sessionId: string;
   cwd: string;
+  /** 已注册的命令名。 */
+  commands: string[];
+  /** UI 收到的通知文本。 */
+  notifications: string[];
+  /** 已注册命令的 handler。 */
+  commandHandlers: Map<
+    string,
+    (args: string, ctx: ExtensionContext) => unknown
+  >;
 }
 
 export interface MockPiOptions {
@@ -41,6 +50,12 @@ export function createMockPiContext(options: MockPiOptions = {}): MockPiContext 
   const sessionId = options.sessionId ?? "ses-pi";
   const cwd = options.cwd ?? "C:/tmp/pi-mock";
   const handlers: RecordedHandler[] = [];
+  const commands: string[] = [];
+  const notifications: string[] = [];
+  const commandHandlers = new Map<
+    string,
+    (args: string, ctx: ExtensionContext) => unknown
+  >();
 
   // 简化版的 SessionManager 桩：仅暴露 getSessionId / getCwd。
   const sessionManager = {
@@ -50,7 +65,9 @@ export function createMockPiContext(options: MockPiOptions = {}): MockPiContext 
 
   // 简化版的 UI 桩：notify / select / custom 都是 noop。
   const ui = {
-    notify: () => undefined,
+    notify: (message: string) => {
+      notifications.push(message);
+    },
     select: async () => undefined,
     custom: async () => undefined,
   };
@@ -83,7 +100,13 @@ export function createMockPiContext(options: MockPiOptions = {}): MockPiContext 
         if (idx >= 0) handlers.splice(idx, 1);
       };
     },
-    registerCommand: () => undefined,
+    registerCommand: (
+      name: string,
+      command: { handler: (args: string, ctx: ExtensionContext) => unknown },
+    ) => {
+      commands.push(name);
+      commandHandlers.set(name, command.handler);
+    },
     getSettings: () => {
       const settings: Record<string, unknown> = {};
       const needsOptions =
@@ -116,7 +139,16 @@ export function createMockPiContext(options: MockPiOptions = {}): MockPiContext 
 
   void api;
 
-  return { ctx, handlers, sessionId, cwd, api };
+  return {
+    ctx,
+    handlers,
+    sessionId,
+    cwd,
+    api,
+    commands,
+    notifications,
+    commandHandlers,
+  };
 }
 
 /** 取出某个事件类型的已注册 handler；不存在则抛错。 */

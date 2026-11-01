@@ -50,6 +50,25 @@ describe('BIC/SWIFT Recognizer', () => {
       expect(matches).toHaveLength(0);
     });
 
+    it('requires a banking context word before the code', () => {
+      const withContext = 'BIC: DEUTDEFF';
+      expect(bicSwiftRecognizer.find(withContext)).toHaveLength(1);
+
+      const withoutContext = 'const FRONTEND = 1;';
+      expect(bicSwiftRecognizer.find(withoutContext)).toHaveLength(0);
+    });
+
+    it('does not accept a partial context word', () => {
+      // `basic` 与 `bankruptcy` 里都不含完整的银行语境词
+      expect(bicSwiftRecognizer.find('basic DEUTDEFF')).toHaveLength(0);
+      expect(bicSwiftRecognizer.find('bankruptcy DEUTDEFF')).toHaveLength(0);
+    });
+
+    it('does not take the context word from the previous line', () => {
+      const text = 'BIC:\nDEUTDEFF';
+      expect(bicSwiftRecognizer.find(text)).toHaveLength(0);
+    });
+
     it('should handle BIC codes at word boundaries', () => {
       const text = 'BICDEUTDEFF123'; // Should not match (no word boundary)
       const matches = bicSwiftRecognizer.find(text);

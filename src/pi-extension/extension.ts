@@ -73,6 +73,8 @@ interface PiExtensionState {
   tagPrefix: string;
   rehydraInstruction: string;
   vcsIdentities: boolean;
+  /** 当前生效的正则识别类型。 */
+  effectiveRegexTypes: string[];
   /** 允许字面标签放行的工具名（见 `allowLiteralTagsIn`）。 */
   allowLiteralTagsIn: Set<string>;
   resolveSession: (sessionId: string) => AnonymizerSessionImpl;
@@ -391,6 +393,9 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
   ): Promise<PiExtensionState> => {
     const options = normalizeRehydraOptions(rawOptions);
     const policy = policyFromOptions(options) ?? {};
+    const effectiveRegexTypes = [
+      ...(policy.regexEnabledTypes ?? createDefaultPolicy().regexEnabledTypes),
+    ].sort();
     const anonymizerConfig: AnonymizerConfig = anonymizerConfigFromOptions(
       options,
       cwd,
@@ -427,6 +432,7 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
       tagPrefix,
       rehydraInstruction,
       vcsIdentities: options.vcsIdentities === true,
+      effectiveRegexTypes,
       allowLiteralTagsIn: new Set(options.allowLiteralTagsIn ?? []),
       resolveSession(sessionId: string): AnonymizerSessionImpl {
         let session = sessionMap.get(sessionId);
@@ -600,6 +606,7 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
           `cwd: ${ctx.sessionManager.getCwd()}`,
           `tagPrefix: ${state.tagPrefix}`,
           `vcsIdentities: ${state.vcsIdentities}`,
+          `regexTypes: ${state.effectiveRegexTypes.join(", ")}`,
         ].join("\n"),
         "info",
       );
