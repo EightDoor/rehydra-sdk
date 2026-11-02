@@ -1,6 +1,6 @@
 {
   "name": "pi-rehydra",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Rehydra Pi extension — anonymizes secrets in Pi conversations via the ExtensionAPI.",
   "type": "module",
   "main": "index.js",
