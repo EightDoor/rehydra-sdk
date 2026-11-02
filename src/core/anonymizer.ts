@@ -119,6 +119,11 @@ function mergePolicyWithBase(
   };
 }
 
+/** 判断信号是否已取消（单独成函数，避免被 TS 的收窄影响）。 */
+function isAborted(signal: AbortSignal | undefined): boolean {
+  return signal !== undefined && signal.aborted;
+}
+
 /** 把取消信号转成标准 AbortError。 */
 function toAbortError(signal: AbortSignal): Error {
   const reason: unknown = signal.reason;
@@ -126,6 +131,28 @@ function toAbortError(signal: AbortSignal): Error {
   const error = new Error("Anonymization aborted");
   error.name = "AbortError";
   return error;
+}
+
+/** 等待期间保持对取消信号的响应：取消时立即以 AbortError 结束。 */
+function raceWithSignal<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return promise;
+  if (signal.aborted) return Promise.reject(toAbortError(signal));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(toAbortError(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 /** 给等待加一个上限；超时抛出可归类为 model-deadline 的错误。 */
@@ -155,6 +182,7 @@ function classifyNerError(error: unknown): string {
   if (message.includes("failed to connect") || message.includes("econnrefused")) {
     return "model-unreachable";
   }
+  if (message.includes("protocol error")) return "protocol-error";
   if (message.includes("not loaded")) return "model-unavailable";
   return "model-failed";
 }
@@ -179,9 +207,14 @@ function notifyObserver(
       replaced: generateTag(entity.type, entity.id, entity.semantic, input.tagFormat),
     };
     if (observer.includeOriginal === true) {
-      hit.original = input.normalizedText.slice(entity.start, entity.end);
+      // 从原文切片，保留内部 CRLF 与规范化的差异
+      hit.original = input.text.slice(hit.start, hit.end);
     }
-    observer.onEntity(hit);
+    try {
+      observer.onEntity(hit);
+    } catch {
+      // 观察者属于诊断通道，异常不能影响脱敏本身
+    }
   }
 }
 
@@ -719,9 +752,13 @@ export class Anonymizer {
       // shortcut: 预算只截断等待，底层请求仍会在自身超时后结束
       nerResult =
         remaining === undefined
-          ? await prediction
-          : await withTimeout(prediction, remaining);
+          ? await raceWithSignal(prediction, run?.signal)
+          : await raceWithSignal(withTimeout(prediction, remaining), run?.signal);
     } catch (error) {
+      // 取消不属于检测失败，始终向上传递
+      const signal = run?.signal;
+      if (signal !== undefined && isAborted(signal)) throw toAbortError(signal);
+      if (error instanceof Error && error.name === "AbortError") throw error;
       if (this.nerFailure === "block" || this.nerFailure === "propagate") {
         throw error;
       }

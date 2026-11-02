@@ -97,6 +97,11 @@ function asPIITypeNames(value: unknown): PIITypeName[] | undefined {
   );
 }
 
+/** 只接受已知取值，其余一律当作未配置。 */
+function asNerFailure(value: unknown): "rules" | "block" | undefined {
+  return value === "rules" || value === "block" ? value : undefined;
+}
+
 /** 记录选项：未知字段忽略，畸形值回落默认。 */
 function asRecordOptions(value: unknown): RecordOptions | undefined {
   if (!isRecord(value)) return undefined;
@@ -166,10 +171,12 @@ export function normalizeRehydraOptions(raw: unknown): RehydraSharedOptions {
     ? (source.anonymizer as AnonymizerConfig)
     : undefined;
   normalized.record = asRecordOptions(source.record);
+  // 完整匿名器配置里的显式取值优先于顶层快捷配置，避免被默认值盖掉
+  const fromAnonymizer = isRecord(source.anonymizer)
+    ? source.anonymizer.nerFailure
+    : undefined;
   normalized.nerFailure =
-    source.nerFailure === "block" || source.nerFailure === "rules"
-      ? source.nerFailure
-      : "rules";
+    asNerFailure(fromAnonymizer) ?? asNerFailure(source.nerFailure) ?? "rules";
 
   return normalized;
 }

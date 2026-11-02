@@ -122,6 +122,29 @@ describe("observer", () => {
     expect(text.slice(entity!.start, entity!.end)).toBe(EMAIL);
   });
 
+  it("maps offsets back when CRLF ends a short line", async () => {
+    anonymizer = await newAnonymizer();
+    const text = `abcdef\r\nz\r\n${EMAIL}`;
+    const collected = collect(text, true);
+    await anonymizer.anonymize(text, undefined, undefined, undefined, collected.observer);
+
+    const [entity] = collected.entities;
+    expect(text.slice(entity!.start, entity!.end)).toBe(EMAIL);
+    expect(entity!.original).toBe(EMAIL);
+  });
+
+  it("keeps CRLF inside a multi-line hit in the original", async () => {
+    anonymizer = await newAnonymizer();
+    // 跨行命中的原值必须与原文完全一致（含内部 \r\n）
+    const text = `前文\r\n----BEGIN PRIVATE KEY----\r\nMIIB\r\n----END PRIVATE KEY----\r\n后文`;
+    const collected = collect(text, true);
+    await anonymizer.anonymize(text, undefined, undefined, undefined, collected.observer);
+
+    for (const entity of collected.entities) {
+      expect(text.slice(entity.start, entity.end)).toBe(entity.original);
+    }
+  });
+
   it("maps offsets after non-BMP characters", async () => {
     anonymizer = await newAnonymizer();
     const text = `𝔘𝔫𝔦𝔠𝔬𝔡𝔢 😀 ${EMAIL}`;
@@ -150,5 +173,25 @@ describe("observer", () => {
     }
     expect(result.piiMap).toBeDefined();
     expect(result.entities.length).toBe(result.stats.totalEntities);
+  });
+});
+
+describe("observer isolation", () => {
+  it("keeps masking working when the observer throws", async () => {
+    anonymizer = await newAnonymizer();
+    const result = await anonymizer.anonymize(
+      `mail ${EMAIL} now`,
+      undefined,
+      undefined,
+      undefined,
+      {
+        onEntity() {
+          throw new Error("observer bug");
+        },
+      },
+    );
+
+    expect(result.anonymizedText).not.toContain(EMAIL);
+    expect(result.piiMap).toBeDefined();
   });
 });

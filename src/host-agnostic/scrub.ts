@@ -136,6 +136,11 @@ export interface ScrubCoreStats {
   detectionErrors?: Array<{ finder: "model"; code: string }>;
 }
 
+/** UTF-8 字节数；浏览器与 Node 都可用。 */
+function utf8Size(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
 /** 累计统计与检测完整性（跨字段共享）。 */
 interface ScrubAccumulator {
   count: number;
@@ -550,7 +555,8 @@ function collectComparisons(
         comparisons.push({ path, before: "", after: "", truncated: true });
         return;
       }
-      const size = before.length + after.length;
+      // 按 UTF-8 字节计费：中文等内容的字符串长度会低估落盘体积
+      const size = utf8Size(before) + utf8Size(after);
       if (used + size > maxBytes) {
         truncated = true;
         return;

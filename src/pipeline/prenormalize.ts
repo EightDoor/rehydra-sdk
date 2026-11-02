@@ -111,14 +111,12 @@ export function createLineEndingMapping(originalText: string): OffsetMapping {
     },
 
     toOriginal(normalizedOffset: number): number {
-      // Add back the removed \r characters
+      // 每个 \r\n 在规范化文本里少一个字符；把落在该位置或之后的前缀补回来
       let adjustment = 0;
-      let currentNormalized = 0;
-
-      for (const pos of crlfPositions) {
-        if (currentNormalized + (pos - adjustment) <= normalizedOffset) {
+      for (const [index, pos] of crlfPositions.entries()) {
+        // 每对被替换掉的 \r 位于规范化下标 pos-index 的 \n 之前
+        if (pos - index < normalizedOffset) {
           adjustment++;
-          currentNormalized = pos - adjustment + 1;
         } else {
           break;
         }

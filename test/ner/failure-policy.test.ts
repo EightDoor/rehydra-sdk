@@ -160,3 +160,72 @@ describe("run budget", () => {
     ).rejects.toThrow(/cancelled by host/);
   });
 });
+
+describe("cancellation during prediction", () => {
+  it("rejects when the host aborts while the model is running", async () => {
+    anonymizer = createAnonymizer({
+      keyProvider: new InMemoryKeyProvider(),
+      piiStorageProvider: new InMemoryPIIStorageProvider(),
+      ner: { mode: "disabled" },
+      nerFailure: "rules",
+    });
+    await anonymizer.initialize();
+    (anonymizer as unknown as { nerModel: INERModel }).nerModel = {
+      ...failingModel,
+      predict: () => new Promise(() => {}),
+    };
+
+    const controller = new AbortController();
+    const pending = anonymizer.anonymize(
+      "hello",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { signal: controller.signal },
+    );
+    controller.abort(new Error("host cancelled"));
+
+    await expect(pending).rejects.toThrow(/host cancelled/);
+  });
+});
+
+describe("protocol error handling", () => {
+  const protocolModel: INERModel = {
+    loaded: true,
+    version: "test-model",
+    async load() {},
+    async predict(): Promise<NERPrediction> {
+      throw new Error("inference protocol error: 1 entity(ies) failed validation");
+    },
+    async dispose() {},
+  };
+
+  it("degrades with a protocol-error code", async () => {
+    anonymizer = createAnonymizer({
+      keyProvider: new InMemoryKeyProvider(),
+      piiStorageProvider: new InMemoryPIIStorageProvider(),
+      ner: { mode: "disabled" },
+      nerFailure: "rules",
+    });
+    await anonymizer.initialize();
+    (anonymizer as unknown as { nerModel: INERModel }).nerModel = protocolModel;
+
+    const result = await anonymizer.anonymize(`mail ${EMAIL}`);
+    expect(result.detectionErrors?.[0]?.code).toBe("protocol-error");
+    expect(result.integrity).toBe("rules-only");
+  });
+
+  it("blocks under the block policy", async () => {
+    anonymizer = createAnonymizer({
+      keyProvider: new InMemoryKeyProvider(),
+      piiStorageProvider: new InMemoryPIIStorageProvider(),
+      ner: { mode: "disabled" },
+      nerFailure: "block",
+    });
+    await anonymizer.initialize();
+    (anonymizer as unknown as { nerModel: INERModel }).nerModel = protocolModel;
+
+    await expect(anonymizer.anonymize("hello")).rejects.toThrow(/protocol error/);
+  });
+});

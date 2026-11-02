@@ -95,7 +95,14 @@ export class InferenceServerNERModel implements INERModel {
     const minConfidence = this.getMinConfidence(policy);
     const result = await this.client.predict(text, minConfidence);
 
-    let spans = this.convertToSpanMatches(result.entities, text);
+    const converted = this.convertToSpanMatches(result.entities, text);
+    if (converted.rejected > 0) {
+      // 响应不可信：整次预测按失败处理，由调用方的 nerFailure 策略决定降级或阻断
+      throw new Error(
+        `inference protocol error: ${converted.rejected} entity(ies) failed validation`,
+      );
+    }
+    let spans = converted.spans;
 
     // Apply policy filtering
     if (policy !== undefined) {
@@ -117,11 +124,22 @@ export class InferenceServerNERModel implements INERModel {
     };
   }
 
-  private convertToSpanMatches(entities: ServerEntityMatch[], text: string): SpanMatch[] {
+  /**
+   * 把服务返回的实体转成跨度。
+   *
+   * 不合规的实体（跨度越界、分数越界、文本与跨度不一致）会被丢弃并计入
+   * `rejected`：协议不一致意味着响应不可信，调用方据此按失败处理。
+   */
+  private convertToSpanMatches(
+    entities: ServerEntityMatch[],
+    text: string,
+  ): { spans: SpanMatch[]; rejected: number } {
     const spans: SpanMatch[] = [];
+    let rejected = 0;
 
     for (const entity of entities) {
       const piiType = SERVER_TYPE_TO_PII_TYPE[entity.type.toUpperCase()];
+      // 不支持的类型是协议允许的，不视为协议错误
       if (piiType === undefined) continue;
       // 校验跨度与置信度：协议不一致时宁可丢弃，也不能错位替换
       if (
@@ -134,10 +152,14 @@ export class InferenceServerNERModel implements INERModel {
         entity.end <= entity.start ||
         entity.end > text.length
       ) {
+        rejected++;
         continue;
       }
-      if (text.slice(entity.start, entity.end) !== entity.text) continue;
-      
+      if (text.slice(entity.start, entity.end) !== entity.text) {
+        rejected++;
+        continue;
+      }
+
       spans.push({
         type: piiType,
         start: entity.start,
@@ -148,8 +170,8 @@ export class InferenceServerNERModel implements INERModel {
         recognizer: this.recognizerId,
       });
     }
-    
-    return spans;
+
+    return { spans, rejected };
   }
 
   private getMinConfidence(policy?: AnonymizationPolicy): number {

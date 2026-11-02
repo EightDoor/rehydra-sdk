@@ -82,28 +82,28 @@ describe("inference server response validation", () => {
     expect(result.spans[0]?.recognizer).toMatch(/^ner:/);
   });
 
-  it("drops an entity whose span exceeds the text", async () => {
+  it("rejects the whole response for an entity whose span exceeds the text", async () => {
     const model = await modelFor({
       entities: [{ type: "PERSON", start: 0, end: 99, confidence: 0.9, text: "Alice" }],
       processing_time_ms: 1,
     });
-    expect((await model.predict("Alice")).spans).toHaveLength(0);
+    await expect(model.predict("Alice")).rejects.toThrow(/protocol error/);
   });
 
-  it("drops an entity whose text does not match the span", async () => {
+  it("rejects the whole response when the text does not match the span", async () => {
     const model = await modelFor({
       entities: [{ type: "PERSON", start: 0, end: 5, confidence: 0.9, text: "Bob" }],
       processing_time_ms: 1,
     });
-    expect((await model.predict("Alice")).spans).toHaveLength(0);
+    await expect(model.predict("Alice")).rejects.toThrow(/protocol error/);
   });
 
-  it("drops an entity with an out-of-range confidence", async () => {
+  it("rejects the whole response for an out-of-range confidence", async () => {
     const model = await modelFor({
       entities: [{ type: "PERSON", start: 0, end: 5, confidence: 1.5, text: "Alice" }],
       processing_time_ms: 1,
     });
-    expect((await model.predict("Alice")).spans).toHaveLength(0);
+    await expect(model.predict("Alice")).rejects.toThrow(/protocol error/);
   });
 
   it("drops an unmapped entity type", async () => {

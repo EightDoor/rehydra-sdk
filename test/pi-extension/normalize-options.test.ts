@@ -74,3 +74,33 @@ describe("normalizeRehydraOptions", () => {
     expect(() => policyFromOptions(options)).toThrow(/policy\.allowlistTerms/);
   });
 });
+
+describe("nerFailure resolution", () => {
+  it("defaults to rules", () => {
+    expect(normalizeRehydraOptions({}).nerFailure).toBe("rules");
+  });
+
+  it("honours the top-level setting", () => {
+    expect(normalizeRehydraOptions({ nerFailure: "block" }).nerFailure).toBe("block");
+  });
+
+  it("lets the explicit anonymizer config win over the default", () => {
+    const normalized = normalizeRehydraOptions({ anonymizer: { nerFailure: "block" } });
+    expect(normalized.nerFailure).toBe("block");
+  });
+
+  it("prefers the anonymizer config over the shortcut", () => {
+    const normalized = normalizeRehydraOptions({
+      nerFailure: "rules",
+      anonymizer: { nerFailure: "block" },
+    });
+    expect(normalized.nerFailure).toBe("block");
+  });
+
+  it("ignores unknown values", () => {
+    expect(
+      normalizeRehydraOptions({ nerFailure: "maybe", anonymizer: { nerFailure: "nah" } })
+        .nerFailure,
+    ).toBe("rules");
+  });
+});

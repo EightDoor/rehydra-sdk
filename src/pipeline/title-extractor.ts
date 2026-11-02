@@ -851,6 +851,7 @@ export function mergeAdjacentTitleSpans(
       // If next is also PERSON, merge them
       if (next.type === PIIType.PERSON) {
         const mergedText = originalText.slice(current.start, next.end);
+        const mergedRecognizer = current.recognizer ?? next.recognizer;
         const mergedSpan: SpanMatch = {
           type: PIIType.PERSON,
           start: current.start,
@@ -863,6 +864,8 @@ export function mergeAdjacentTitleSpans(
               ? current.source
               : DetectionSource.HYBRID,
           text: mergedText,
+          // 合并后仍归因到产生该命中的检测器
+          ...(mergedRecognizer === undefined ? {} : { recognizer: mergedRecognizer }),
           // Preserve any existing semantic attributes from either span
           semantic: {
             ...current.semantic,

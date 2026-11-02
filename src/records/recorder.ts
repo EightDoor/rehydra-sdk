@@ -4,7 +4,7 @@
  * 内存里保留最近若干条供 `/rehydra log` 读取；开启后按天追加写入用户目录。
  * 记录层任何失败都只告警，绝不影响脱敏与请求。
  */
-import { appendFile, mkdir, readFile, readdir, rm, lstat } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rename, rm, lstat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { MaskingRecord } from "./types.js";
 
@@ -58,7 +58,6 @@ export class MaskingRecorder {
   private queue: Promise<void> = Promise.resolve();
   private pending = 0;
   private dropped = 0;
-  private lastPrune = 0;
   private warnedWrite = false;
 
   constructor(
@@ -128,26 +127,38 @@ export class MaskingRecorder {
     return filtered.reverse().slice(0, limit);
   }
 
-  /** 按标识或唯一前缀查找记录（内存优先，其次磁盘）。 */
+  /** 按标识或唯一前缀查找记录：内存与磁盘一起判定，避免漏掉磁盘侧的歧义。 */
   async find(idOrPrefix: string): Promise<RecordLookup> {
-    const fromMemory = this.match(this.memory, idOrPrefix);
-    if (fromMemory.kind !== "missing") return fromMemory;
-
-    const disk = await this.readAll();
-    return this.match(disk, idOrPrefix);
+    const seen = new Map<string, MaskingRecord>();
+    for (const record of this.memory) seen.set(record.id, record);
+    for (const record of await this.readAll()) {
+      if (!seen.has(record.id)) seen.set(record.id, record);
+    }
+    return this.match([...seen.values()], idOrPrefix);
   }
 
-  /** 清除记录：`session` 只清当前会话，`all` 清全部。 */
+  /**
+   * 清除记录：`session` 只清当前会话，`all` 清全部。
+   *
+   * 落盘记录也要真的删掉，否则清理后仍能从磁盘读回原文。
+   */
   async clear(kind: "session" | "all", sessionId?: string): Promise<void> {
+    // 先落完队尾，避免清理后旧记录又被写回来
+    await this.flush();
+    if (!(await this.assertSafeDir())) return;
+
     if (kind === "all") {
       this.memory.length = 0;
-      await this.removeAllFiles();
+      for (const file of await this.dayFiles()) {
+        await rm(file.path, { force: true });
+      }
       return;
     }
+
     for (let i = this.memory.length - 1; i >= 0; i -= 1) {
       if (this.memory[i]?.sessionId === sessionId) this.memory.splice(i, 1);
     }
-    // 磁盘记录按天成文件，无法只删一个会话；保留文件，读取时按会话过滤
+    await this.rewriteWithoutSession(sessionId);
   }
 
   /** 等待队列落盘（测试与退出前使用）。 */
@@ -174,31 +185,101 @@ export class MaskingRecorder {
   }
 
   private async persist(record: MaskingRecord): Promise<void> {
-    if (!(await this.ensureDir())) return;
+    if (!(await this.assertSafeDir())) return;
     const path = this.dayFile(Date.parse(record.time));
-    await appendFile(path, `${JSON.stringify(record)}\n`, { encoding: "utf-8", mode: 0o600 });
-    if (Date.now() - this.lastPrune > 60 * 60 * 1000) {
-      this.lastPrune = Date.now();
-      await this.prune();
+    if (!(await this.assertSafeFile(path))) return;
+    await writeFile(path, `${JSON.stringify(record)}\n`, {
+      encoding: "utf-8",
+      mode: 0o600,
+      flag: "a",
+    });
+    // 每次写入后都检查容量，而不是按小时节流
+    await this.prune();
+  }
+
+  /**
+   * 目标文件必须是普通文件。
+   *
+   * `appendFile` 会跟随符号链接，把记录写到别处；`mode` 只作用于新建文件，
+   * 已存在的宽松权限需要用 chmod 收紧。
+   */
+  private async assertSafeFile(path: string): Promise<boolean> {
+    try {
+      const info = await lstat(path);
+      if (info.isSymbolicLink() || !info.isFile()) {
+        this.log("warn", "records file is not a regular file, refusing to write", {
+          reason: "unsafe-file",
+        });
+        return false;
+      }
+      if ((info.mode & 0o077) !== 0) {
+        await chmod(path, 0o600).catch(() => undefined);
+      }
+      return true;
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code === "ENOENT") return true;
+      this.warnWrite(error);
+      return false;
     }
   }
 
-  private async ensureDir(): Promise<boolean> {
+  /** 目录必须是真实目录：符号链接可能把记录写到别处，直接拒绝。 */
+  private async assertSafeDir(): Promise<boolean> {
     try {
       await mkdir(this.options.dir, { recursive: true, mode: 0o700 });
       const info = await lstat(this.options.dir);
-      if (info.isSymbolicLink()) {
-        // 符号链接可能把记录写到别处，直接拒绝
+      if (info.isSymbolicLink() || !info.isDirectory()) {
         if (!this.warnedWrite) {
           this.warnedWrite = true;
-          this.log("warn", "records directory is a symlink, refusing to write");
+          this.log("warn", "records directory is not a real directory, refusing to write");
         }
         return false;
+      }
+      if ((info.mode & 0o077) !== 0) {
+        await chmod(this.options.dir, 0o700).catch(() => undefined);
       }
       return true;
     } catch (error) {
       this.warnWrite(error);
       return false;
+    }
+  }
+
+  /** 把某个会话的记录从磁盘文件里摘掉，其余记录原样保留。 */
+  private async rewriteWithoutSession(sessionId: string | undefined): Promise<void> {
+    if (sessionId === undefined) return;
+    for (const file of await this.dayFiles()) {
+      let content: string;
+      try {
+        content = await readFile(file.path, "utf-8");
+      } catch {
+        continue;
+      }
+      const lines = content.split("\n").filter((line) => line.trim() !== "");
+      const kept: string[] = [];
+      let removed = 0;
+      for (const line of lines) {
+        try {
+          const record = JSON.parse(line) as MaskingRecord;
+          if (record.sessionId === sessionId) {
+            removed += 1;
+            continue;
+          }
+          kept.push(line);
+        } catch {
+          // 损坏行不参与筛选，原样保留以免误删他人记录
+          kept.push(line);
+        }
+      }
+      if (removed === 0) continue;
+      const tmp = `${file.path}.tmp`;
+      if (kept.length === 0) {
+        await rm(file.path, { force: true });
+        continue;
+      }
+      await writeFile(tmp, `${kept.join("\n")}\n`, { encoding: "utf-8", mode: 0o600 });
+      await rename(tmp, file.path);
     }
   }
 
@@ -260,12 +341,6 @@ export class MaskingRecorder {
       }
     }
     return records;
-  }
-
-  private async removeAllFiles(): Promise<void> {
-    for (const file of await this.dayFiles()) {
-      await rm(file.path, { force: true });
-    }
   }
 
   private warnWrite(error: unknown): void {

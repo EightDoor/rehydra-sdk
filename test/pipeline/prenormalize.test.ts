@@ -206,7 +206,7 @@ describe('createLineEndingMapping', () => {
 
     // Before first CRLF
     expect(mapping.toOriginal(0)).toBe(0);
-    expect(mapping.toOriginal(5)).toBe(6); // Position 5 in normalized (\n) maps to position 6 in original (\n)
+    expect(mapping.toOriginal(5)).toBe(5); // 归一化下标 5 是换行前的边界
 
     // After first CRLF
     expect(mapping.toOriginal(6)).toBe(7); // Normalized 6 -> Original 7
@@ -233,7 +233,7 @@ describe('createLineEndingMapping', () => {
     expect(mapping.toOriginal(0)).toBe(0); // A
     expect(mapping.toOriginal(2)).toBe(3); // After first \n
     expect(mapping.toOriginal(4)).toBe(6); // After second \n
-    expect(mapping.toOriginal(6)).toBe(8); // After third \n (position 6 in normalized maps to position 8 in original)
+    expect(mapping.toOriginal(6)).toBe(9); // 第三个换行之后 (规范化 6 -> 原文 9)
   });
 
   it('should handle CRLF at start of string', () => {
@@ -242,7 +242,7 @@ describe('createLineEndingMapping', () => {
 
     expect(mapping.toNormalized(0)).toBe(0);
     expect(mapping.toNormalized(2)).toBe(1); // After \r\n
-    expect(mapping.toOriginal(0)).toBe(1); // Position 0 in normalized (\n) maps to position 1 in original (\n)
+    expect(mapping.toOriginal(0)).toBe(0); // 归一化下标 0 之前的边界
     expect(mapping.toOriginal(1)).toBe(2);
   });
 
@@ -252,7 +252,7 @@ describe('createLineEndingMapping', () => {
 
     expect(mapping.toNormalized(4)).toBe(4); // Before \r\n
     expect(mapping.toNormalized(6)).toBe(5); // After \r\n
-    expect(mapping.toOriginal(4)).toBe(5); // Position 4 in normalized maps to position 5 in original
+    expect(mapping.toOriginal(4)).toBe(4);
     expect(mapping.toOriginal(5)).toBe(6);
   });
 
@@ -269,6 +269,30 @@ describe('createLineEndingMapping', () => {
     expect(mapping.toOriginal(3)).toBe(5);
   });
 
+  it('should keep prefix equivalence for every offset', () => {
+    const samples = [
+      'abcdef\r\nz\r\nalice@example.com',
+      'Line1\r\nLine2\r\nLine3',
+      'A\r\n\r\nB',
+      '\r\nLine',
+      'Line\r\n',
+      '\r\n\r\n',
+      'no line endings here',
+    ];
+
+    for (const text of samples) {
+      const normalized = prenormalize(text);
+      const mapping = createLineEndingMapping(text);
+      for (let offset = 0; offset <= normalized.length; offset++) {
+        const originalOffset = mapping.toOriginal(offset);
+        expect(
+          prenormalize(text.slice(0, originalOffset)),
+          `${JSON.stringify(text)} @${offset}`,
+        ).toBe(normalized.slice(0, offset));
+      }
+    }
+  });
+
   it('should handle text with only CRLF', () => {
     const text = '\r\n\r\n';
     const mapping = createLineEndingMapping(text);
@@ -276,8 +300,8 @@ describe('createLineEndingMapping', () => {
     expect(mapping.toNormalized(0)).toBe(0);
     expect(mapping.toNormalized(2)).toBe(1);
     expect(mapping.toNormalized(4)).toBe(2);
-    expect(mapping.toOriginal(0)).toBe(1); // Position 0 (\n) maps to position 1 (\n)
-    expect(mapping.toOriginal(1)).toBe(3); // Position 1 in normalized maps to position 3 in original
+    expect(mapping.toOriginal(0)).toBe(0);
+    expect(mapping.toOriginal(1)).toBe(2);
     expect(mapping.toOriginal(2)).toBe(4);
   });
 });

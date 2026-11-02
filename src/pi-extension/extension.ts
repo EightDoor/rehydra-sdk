@@ -637,8 +637,8 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
       ...anonymizerConfig,
       keyProvider,
       piiStorageProvider: piiStorage,
-      // Pi 显式启用模型检测后，默认降级为规则；SDK 未配置时仍保持抛错
-      nerFailure: options.nerFailure ?? "rules",
+      // 优先级：完整匿名器配置 > 顶层快捷配置 > Pi 默认（降级为规则）
+      nerFailure: anonymizerConfig.nerFailure ?? options.nerFailure ?? "rules",
     });
     const tagFormat =
       anonymizerConfig.tagFormat ??
@@ -806,6 +806,15 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
       const startedAt = Date.now();
       const hits: ScrubHit[] = [];
       const comparisons: ScrubComparison[] = [];
+      // 与 context 路径一致：整次事件共享模型预算，宿主取消直接结束
+      const run = {
+        deadline: Date.now() + MODEL_BUDGET_MS,
+        ...(ctx.signal instanceof AbortSignal ? { signal: ctx.signal } : {}),
+      };
+      let compareBytes = 0;
+      let comparisonsTruncated = false;
+      let integrity: "complete" | "rules-only" | undefined;
+      const detectionErrors: Array<{ finder: "model"; code: string }> = [];
       if (Array.isArray(event.content)) {
         const scrubbed: typeof event.content = [];
         for (const part of event.content) {
@@ -837,17 +846,33 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
                     },
                   }
                 : undefined,
+              run,
             );
+            if (anonymized.integrity !== undefined) integrity = anonymized.integrity;
+            for (const entry of anonymized.detectionErrors ?? []) {
+              if (!detectionErrors.some((item) => item.code === entry.code)) {
+                detectionErrors.push(entry);
+              }
+            }
             if (
               state.recorder.enabled &&
               state.recorder.includeOriginal &&
               anonymized.anonymizedText !== part.text
             ) {
-              comparisons.push({
-                path: `tool_result[${scrubbed.length}]`,
-                before: part.text,
-                after: anonymized.anonymizedText,
-              });
+              // 按字节计费，避免中文等多字节内容突破单条记录上限
+              const size =
+                new TextEncoder().encode(part.text).length +
+                new TextEncoder().encode(anonymized.anonymizedText).length;
+              if (compareBytes + size > state.recorder.maxRecordBytes) {
+                comparisonsTruncated = true;
+              } else {
+                compareBytes += size;
+                comparisons.push({
+                  path: `tool_result[${scrubbed.length}]`,
+                  before: part.text,
+                  after: anonymized.anonymizedText,
+                });
+              }
             }
             scrubbed.push({ type: "text", text: anonymized.anonymizedText });
           } else {
@@ -858,10 +883,14 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
       }
       // 在源头对 details / structuredContent 做递归脱敏（递归 deep-rehydrate）。
       // 留空，避免破坏 TUI 渲染细节。structuredContent 不在 LLM 上下文中。
+      if (detectionErrors.length > 0) warnDegradedOnce(state, detectionErrors);
       recordRequest(state, ctx.sessionManager.getSessionId(), "tool_result", startedAt, {
         scrubbed: hits.length,
         hits,
         comparisons,
+        truncated: comparisonsTruncated,
+        ...(integrity === undefined ? {} : { integrity }),
+        ...(detectionErrors.length === 0 ? {} : { detectionErrors }),
       });
       return result;
     },

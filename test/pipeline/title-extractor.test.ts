@@ -7,6 +7,7 @@ import {
   getTitlesForLanguage,
   getAllTitles,
   startsWithTitle,
+  mergeAdjacentTitleSpans,
 } from "../../src/pipeline/title-extractor.js";
 import { PIIType, SpanMatch, DetectionSource } from "../../src/types/index.js";
 
@@ -604,5 +605,35 @@ describe("Title Extractor", () => {
       expect(result.length).toBe(1);
       expect(result[0]?.semantic?.gender).toBe("male");
     });
+  });
+});
+
+describe("mergeAdjacentTitleSpans attribution", () => {
+  it("keeps the recognizer of the merged spans", () => {
+    const text = "Dr. Alice";
+    const spans: SpanMatch[] = [
+      {
+        type: PIIType.PERSON,
+        start: 0,
+        end: 3,
+        confidence: 0.9,
+        source: DetectionSource.NER,
+        text: "Dr.",
+        recognizer: "ner:test",
+      },
+      {
+        type: PIIType.PERSON,
+        start: 4,
+        end: 9,
+        confidence: 0.9,
+        source: DetectionSource.NER,
+        text: "Alice",
+        recognizer: "ner:test",
+      },
+    ];
+
+    const merged = mergeAdjacentTitleSpans(spans, text);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.recognizer).toBe("ner:test");
   });
 });

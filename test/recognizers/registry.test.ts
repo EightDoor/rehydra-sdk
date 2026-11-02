@@ -9,6 +9,7 @@ import { phoneRecognizer } from '../../src/recognizers/phone.js';
 import { ukPostalCodeRecognizer } from '../../src/recognizers/postal-code.js';
 import { urlRecognizer } from '../../src/recognizers/url.js';
 import { createRegexRecognizer } from '../../src/recognizers/base.js';
+import { createDefaultRegistry } from '../../src/recognizers/index.js';
 import { PIIType, createDefaultPolicy, type Recognizer } from '../../src/types/index.js';
 
 describe('RecognizerRegistry', () => {
@@ -383,18 +384,28 @@ describe('createRegistry', () => {
 
 describe('RecognizerRegistry attribution', () => {
   it('tags every regex hit with a stable detector id', () => {
-    const registry = createRegistry();
+    // 必须用带识别器的默认注册表：createRegistry() 与全局注册表都是空的
+    const registry = createDefaultRegistry();
     const policy = createDefaultPolicy();
     // 各类型挑一个能命中的样本
     const samples: Array<[string, string]> = [
       ['EMAIL', ['alice', '@', 'example.com'].join('')],
-      ['PHONE', ['+49', '30', '1234567'].join(' ')],
       ['URL', 'see https://example.com/a for details'],
+      ['IBAN', `IBAN ${['DE89', '3704', '0044', '0532', '0130', '00'].join('')}`],
     ];
 
-    for (const [, sample] of samples) {
-      for (const match of registry.findAll(sample, policy)) {
-        expect(match.recognizer, `missing detector for ${sample}`).toBeTruthy();
+    // 断言精确标识：标识必须稳定，不能随识别器显示名变化
+    const expected: Record<string, string> = {
+      EMAIL: 'email',
+      URL: 'url',
+      IBAN: 'iban',
+    };
+    for (const [type, sample] of samples) {
+      const matches = registry.findAll(sample, policy);
+      expect(matches.length, `no hit for ${sample}`).toBeGreaterThan(0);
+      for (const match of matches) {
+        expect(match.type).toBe(type);
+        expect(match.recognizer, `detector for ${sample}`).toBe(expected[type]);
       }
     }
   });
