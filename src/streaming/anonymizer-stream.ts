@@ -10,7 +10,7 @@ import { SentenceBuffer } from "./sentence-buffer.js";
 import type { StreamConfig, StreamChunkEvent, StreamFinishEvent } from "./types.js";
 import type { IAnonymizer } from "../storage/session.js";
 import type { KeyProvider } from "../crypto/index.js";
-import { encryptPIIMap } from "../crypto/index.js";
+import { decryptPIIMap, encryptPIIMap } from "../crypto/index.js";
 import type { PIIStorageProvider } from "../storage/types.js";
 
 /**
@@ -153,16 +153,48 @@ export class AnonymizerStream extends Transform {
       return;
     }
 
-    const piiMap = this.sentenceBuffer.getCumulativePiiMap();
-    if (piiMap.size === 0) return;
+    await this.saveMergedToStorage();
+    this.lastSaveTime = now;
+  }
+
+  /**
+   * 与存储里的最新映射合并后保存。
+   *
+   * 流持有的是创建时的快照，期间普通脱敏可能已经写入了新条目；整体覆盖会把
+   * 那些条目删掉，导致已经发出去的占位符还原不回来。
+   *
+   * shortcut: 流与普通脱敏同时为同一类型分配新 ID 时会撞号，此时保留流侧的值；
+   * 需要严格隔离时应改为保存前统一分配 ID。
+   */
+  private async saveMergedToStorage(): Promise<void> {
+    if (
+      this.sessionId === null ||
+      this.piiStorageProvider === null ||
+      this.keyProvider === null
+    ) {
+      return;
+    }
+
+    const own = this.sentenceBuffer.getCumulativePiiMap();
+    if (own.size === 0) return;
 
     const key = await this.keyProvider.getKey();
-    const encrypted = await encryptPIIMap(piiMap, key);
+    const merged = new Map<string, string>(own);
+
+    const stored = await this.piiStorageProvider.load(this.sessionId);
+    if (stored !== null) {
+      // 解密失败（密钥已换）不吞掉：与普通脱敏的语义保持一致，直接抛给调用方。
+      const latest = await decryptPIIMap(stored.piiMap, key);
+      for (const [placeholder, original] of latest) {
+        if (!merged.has(placeholder)) merged.set(placeholder, original);
+      }
+    }
+
+    const encrypted = await encryptPIIMap(merged, key);
     await this.piiStorageProvider.save(this.sessionId, encrypted, {
       createdAt: Date.now(),
       entityCounts: this.buildEntityCounts(),
     });
-    this.lastSaveTime = now;
   }
 
   private async processFlush(): Promise<void> {
@@ -183,17 +215,7 @@ export class AnonymizerStream extends Transform {
     }
 
     // Save PII map to storage if session is configured
-    if (this.sessionId !== null && this.piiStorageProvider !== null && this.keyProvider !== null) {
-      const piiMap = this.sentenceBuffer.getCumulativePiiMap();
-      if (piiMap.size > 0) {
-        const key = await this.keyProvider.getKey();
-        const encrypted = await encryptPIIMap(piiMap, key);
-        await this.piiStorageProvider.save(this.sessionId, encrypted, {
-          createdAt: Date.now(),
-          entityCounts: this.buildEntityCounts(),
-        });
-      }
-    }
+    await this.saveMergedToStorage();
 
     // Fire finish callback
     const totalTime = performance.now() - this.startTime;

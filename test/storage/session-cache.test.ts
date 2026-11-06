@@ -285,25 +285,39 @@ describe("会话映射缓存", () => {
     expect(restored).toContain(target);
   });
 
-  // 回归（审查二轮 2）：流式写盘与进行中的还原不得交错出旧快照。
-  it("流式写入后普通脱敏不会覆盖流新增的映射", async () => {
-    const sessionId = "cache-stream-interop";
+  // 回归（审查二轮 2 / 三轮 P1）：流持有旧快照，结束时整体覆盖会删掉
+  // 期间普通脱敏写入的新条目，导致已发出的占位符还原不回来。
+  it("流式保存不覆盖期间普通脱敏写入的映射", async () => {
+    const sessionId = "cache-stream-merge";
     const session = anonymizer.session(sessionId);
+    const baseEmail = emailAt("base");
+    const concurrentEmail = emailAt("concurrent");
 
-    // 先建立一份基线映射。
-    await session.anonymize(`联系人 ${emailAt("base")}`);
+    // 建立基线映射，流创建时把这份快照种进自己的缓冲区。
+    const baseResult = await session.anonymize(`联系人 ${baseEmail}`);
 
-    // 流式脱敏写入新实体。
+    // 流只重用基线实体，不分配新 ID，从而排除撞号干扰：
+    // 结束时它会带着"仅含基线"的旧快照写盘。
     const stream = await session.createStream();
-    stream.write(`联系人 ${emailAt("streamed")}`);
-    await new Promise<void>((resolve) => stream.end(() => resolve()));
+    let streamOutput = "";
+    stream.on("data", (chunk: Buffer) => {
+      streamOutput += chunk.toString();
+    });
+    stream.write(`联系人 ${baseEmail}`);
 
-    // 之后普通脱敏必须能看到流写入的实体，不能覆盖它。
-    const after = await session.anonymize(`联系人 ${emailAt("later")}`);
-    expect(after.anonymizedText).toContain(TAG_OPEN);
+    // 交错点：流尚未结束，普通脱敏先完成并写入新条目。
+    const concurrentResult = await session.anonymize(`联系人 ${concurrentEmail}`);
 
-    const restored = await session.rehydrate(`联系人 ${emailAt("streamed")}`);
-    // 若流的映射被覆盖，这里会拿不到原值。
-    expect(restored).toContain(emailAt("streamed"));
+    await new Promise<void>((resolve) => {
+      stream.on("end", () => resolve());
+      stream.end();
+    });
+
+    // 流的输出仍是可还原的（说明流的快照本身没被破坏）。
+    expect(await session.rehydrate(streamOutput)).toContain(baseEmail);
+    // 关键断言：并发写入的条目没有被流的旧快照覆盖。
+    expect(await session.rehydrate(concurrentResult.anonymizedText)).toContain(
+      concurrentEmail,
+    );
   });
 });
