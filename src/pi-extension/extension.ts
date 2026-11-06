@@ -7,12 +7,14 @@
  * - `tool_call` 在工具执行前严格还原入参标签；还原不全即阻断该次调用；
  * - `tool_result` 在结果回填给模型前就地脱敏真实 PII；
  * - `message_end` 改写最终 assistant 文本，把 PII 标签还原为真值；
- * - `session_start` / `session_shutdown` 管理会话与匿名器生命周期；
- * - `input` / `user_bash` 在源头做最低限度的脱敏，避免走特殊路径的 PII 漏出。
+ * - `session_start` / `session_shutdown` 管理会话与匿名器生命周期。
  *
  * 设计目标：
  * - 复用 {@link scrubCore} 递归处理消息树；
- * - 失败关闭：任何 scrub 异常都向上抛出，Pi 会停在该请求而不是泄漏；
+ * - 覆盖宿主会转成模型输入的全部消息角色（user / assistant / toolResult /
+ *   system / bashExecution / custom / 两类摘要）；
+ * - 失败语义：宿主会吞掉处理器异常并继续用未脱敏内容发请求，因此脱敏异常
+ *   在扩展内自行捕获并告警；工具执行路径则失败关闭（阻断该次调用）；
  * - 资源释放：`session_shutdown` 幂等释放 session 注册表与匿名器；
  * - 暴露 `/rehydra` 命令，便于用户在交互模式快速查看当前配置。
  */
@@ -60,6 +62,7 @@ import {
   scrubCore,
   type ScrubComparison,
   type ScrubCoreOptions,
+  type ScrubCoreStats,
   type ScrubHit,
   type ScrubHost,
   type ScrubMessage,
@@ -170,6 +173,16 @@ function buildScrubHost(state: PiExtensionState): ScrubHost {
 
 /** 单次宿主事件允许花在模型检测上的时间上限。 */
 const MODEL_BUDGET_MS = 5000;
+
+/**
+ * system 消息里存放工具声明的提示分段名。
+ *
+ * 该段是工具描述文本，替换成占位符会改变模型看到的工具语义，因此不参与脱敏。
+ */
+const SYSTEM_TOOLS_SECTION = "tools";
+
+/** 注入占位符说明用的提示分段名。 */
+const REHYDRA_SECTION = "rehydra";
 
 /** 降级告警按服务地址每分钟至多一条（记录在 state 上）。 */
 function warnDegradedOnce(state: PiExtensionState, errors: Array<{ code: string }>): void {
@@ -410,6 +423,17 @@ function createConsoleLogger(): ScrubHost["log"] {
 }
 
 /**
+ * 一条消息里被投影出来的文本块，各自从哪里取、scrub 后写回哪里。
+ *
+ * 只有把整条消息正文投影成独立文本块的角色需要它：system 的提示分段、
+ * bashExecution 的命令与输出、custom 的字符串正文、两类摘要的正文。
+ * 其余角色（user / assistant / toolResult）沿用按块索引回写。
+ */
+type FieldWriteTarget =
+  | { kind: "field"; field: string }
+  | { kind: "section"; key: string };
+
+/**
  * Pi 中的 `UserMessage.content` 可以是字符串或 `(TextContent | ImageContent)[]`。
  * 共享核心按 `ScrubPart[]` 处理，所以这里把它统一拍平为 `[{ type: "text", text }]`。
  * 同时记录下原字段是字符串，以便 scrub 后把改动写回到原字段。
@@ -418,11 +442,13 @@ interface MessageRewrite {
   scrubMessages: ScrubMessage[];
   /** index in scrubMessages -> 原始 content 字段是否是字符串 */
   userStringContent: Map<number, { original: string }>;
+  /** index in scrubMessages -> 投影文本块各自的写回位置 */
+  fieldWrites: Map<number, FieldWriteTarget[]>;
 }
-
 function normalizeMessagesForScrub(messages: AgentMessage[]): MessageRewrite {
   const scrubMessages: ScrubMessage[] = [];
   const userStringContent = new Map<number, { original: string }>();
+  const fieldWrites = new Map<number, FieldWriteTarget[]>();
   messages.forEach((m, index) => {
     const role = (m as { role?: string }).role;
     if (role === "user") {
@@ -435,9 +461,13 @@ function normalizeMessagesForScrub(messages: AgentMessage[]): MessageRewrite {
         return;
       }
     }
-    scrubMessages.push(agentMessageToScrub(m));
+    const projected = projectMessage(m);
+    scrubMessages.push(projected.scrub);
+    if (projected.writes.length > 0) {
+      fieldWrites.set(index, projected.writes);
+    }
   });
-  return { scrubMessages, userStringContent };
+  return { scrubMessages, userStringContent, fieldWrites };
 }
 
 /**
@@ -449,14 +479,22 @@ function normalizeMessagesForScrub(messages: AgentMessage[]): MessageRewrite {
  *   content，那会让 toolResult 变成 scrub 侧结构、模型看不到任何工具输出；
  * - 其余（user / assistant 数组 content）：parts 与原始 content 元素一一对应，
  *   按块类型回写 text / thinking / toolCall.arguments。
+ * - 有字段写回计划的消息（system / bashExecution / custom / 摘要）：
+ *   按计划把投影出的文本块写回对应字段或提示分段，跳过按块索引回写。
  */
 function restoreMessagesFromScrub(
   originals: AgentMessage[],
   scrubbed: ScrubMessage[],
   userStringContent: Map<number, { original: string }>,
+fieldWrites: Map<number, FieldWriteTarget[]>,
 ): void {
   scrubbed.forEach((scrub, index) => {
     const original = originals[index] as { role?: string; content?: unknown };
+    const writes = fieldWrites.get(index);
+    if (writes !== undefined) {
+      restoreProjectedFields(original, scrub, writes);
+      return;
+    }
     if (userStringContent.has(index)) {
       const firstPart = scrub.content?.[0];
       if (
@@ -512,27 +550,47 @@ function writeScrubbedBlock(block: Record<string, unknown>, part: ScrubPart): vo
   }
 }
 
-function agentMessageToScrub(message: AgentMessage): ScrubMessage {
+/**
+ * 一条消息的投影结果：可脱敏的文本块 + 各自的写回位置。
+ */
+interface MessageProjection {
+  /** 交给共享核心扫描的结构。 */
+  scrub: ScrubMessage;
+  /** 与 `scrub.content` 下标一一对应的写回位置；为空表示沿用按块索引回写。 */
+  writes: FieldWriteTarget[];
+}
+
+/**
+ * 把一条 Pi 消息投影成共享核心可扫描的结构。
+ *
+ * 覆盖宿主会转成模型输入的全部角色：user / assistant / toolResult 沿用
+ * 按块索引回写；system / bashExecution / custom / 两类摘要把正文投影成
+ * 独立文本块，并记录各自的写回位置。
+ */
+function projectMessage(message: AgentMessage): MessageProjection {
   const role = (message as { role?: string }).role;
   if (role === "user") {
     const content = (message as { content?: unknown }).content;
     if (typeof content === "string") {
       return {
-        content: [{ type: "text", text: content }],
+        scrub: { content: [{ type: "text", text: content }] },
+        writes: [],
       };
     }
     if (Array.isArray(content)) {
       return {
-        content: content.map((part) => textPartFromContent(part)),
+        scrub: { content: content.map((part) => textPartFromContent(part)) },
+        writes: [],
       };
     }
-    return {};
+    return { scrub: {}, writes: [] };
   }
   if (role === "assistant") {
     const content = (message as { content?: unknown }).content;
-    if (!Array.isArray(content)) return {};
+    if (!Array.isArray(content)) return { scrub: {}, writes: [] };
     return {
-      content: content.map((block) => assistantBlockToPart(block)),
+      scrub: { content: content.map((block) => assistantBlockToPart(block)) },
+      writes: [],
     };
   }
   if (role === "toolResult") {
@@ -548,19 +606,155 @@ function agentMessageToScrub(message: AgentMessage): ScrubMessage {
       }
     }
     return {
-      content: [
-        {
-          type: "tool-result",
-          id: toolCallId,
-          callID: toolCallId,
-          result: texts,
-        },
-      ],
+      scrub: {
+        content: [
+          {
+            type: "tool-result",
+            id: toolCallId,
+            callID: toolCallId,
+            result: texts,
+          },
+        ],
+      },
+      writes: [],
     };
   }
-  return {};
+  if (role === "system") {
+    return projectSystemMessage(message);
+  }
+  if (role === "bashExecution") {
+    return projectBashExecutionMessage(message);
+  }
+  if (role === "custom") {
+    return projectCustomMessage(message);
+  }
+  if (role === "branchSummary" || role === "compactionSummary") {
+    return projectSummaryMessage(message);
+  }
+  return { scrub: {}, writes: [] };
 }
 
+/**
+ * system 消息：提示正文在 `content` 与 `sections` 各段里，两者都会进 provider 的
+ * system prompt。`sections.tools` 是工具声明，替换会改变工具语义，跳过。
+ */
+function projectSystemMessage(message: AgentMessage): MessageProjection {
+  const content = (message as { content?: unknown }).content;
+  const sections = (message as { sections?: unknown }).sections;
+  const parts: ScrubPart[] = [];
+  const writes: FieldWriteTarget[] = [];
+
+  if (typeof content === "string" && content.length > 0) {
+    parts.push({ type: "text", text: content });
+    writes.push({ kind: "field", field: "content" });
+  }
+
+  if (sections !== null && typeof sections === "object") {
+    for (const [key, value] of Object.entries(sections as Record<string, unknown>)) {
+      // null 表示该段被移除，没有正文可脱敏。
+      if (typeof value !== "string") continue;
+      if (key === SYSTEM_TOOLS_SECTION) continue;
+      parts.push({ type: "text", text: value });
+      writes.push({ kind: "section", key });
+    }
+  }
+
+  return { scrub: { content: parts }, writes };
+}
+
+/**
+ * bashExecution 消息：命令与输出都会被转成 user 文本发给模型，两处都要脱敏。
+ */
+function projectBashExecutionMessage(message: AgentMessage): MessageProjection {
+  const parts: ScrubPart[] = [];
+  const writes: FieldWriteTarget[] = [];
+  const command = (message as { command?: unknown }).command;
+  const output = (message as { output?: unknown }).output;
+  if (typeof command === "string") {
+    parts.push({ type: "text", text: command });
+    writes.push({ kind: "field", field: "command" });
+  }
+  if (typeof output === "string") {
+    parts.push({ type: "text", text: output });
+    writes.push({ kind: "field", field: "output" });
+  }
+  return { scrub: { content: parts }, writes };
+}
+
+/**
+ * custom 消息：`content` 为字符串时整体投影；为内容块数组时沿用按块索引回写。
+ */
+function projectCustomMessage(message: AgentMessage): MessageProjection {
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === "string") {
+    return {
+      scrub: { content: [{ type: "text", text: content }] },
+      writes: [{ kind: "field", field: "content" }],
+    };
+  }
+  if (Array.isArray(content)) {
+    return {
+      scrub: { content: content.map((part) => textPartFromContent(part)) },
+      writes: [],
+    };
+  }
+  return { scrub: {}, writes: [] };
+}
+
+/**
+ * branchSummary / compactionSummary 消息：摘要正文会被转成 user 文本发给模型。
+ */
+function projectSummaryMessage(message: AgentMessage): MessageProjection {
+  const summary = (message as { summary?: unknown }).summary;
+  if (typeof summary !== "string") return { scrub: {}, writes: [] };
+  return {
+    scrub: { content: [{ type: "text", text: summary }] },
+    writes: [{ kind: "field", field: "summary" }],
+  };
+}
+
+/**
+ * 按写回计划把投影出的文本块写回原消息的字段或提示分段。
+ */
+function restoreProjectedFields(
+  original: { role?: string; content?: unknown },
+  scrub: ScrubMessage,
+  writes: FieldWriteTarget[],
+): void {
+  const parts = scrub.content;
+  if (!Array.isArray(parts)) return;
+  writes.forEach((target, index) => {
+    const part = parts[index];
+    if (part === undefined || typeof part.text !== "string") return;
+    if (target.kind === "field") {
+      (original as Record<string, unknown>)[target.field] = part.text;
+      return;
+    }
+    const sections = (original as { sections?: unknown }).sections;
+    if (sections === null || typeof sections !== "object") return;
+    (sections as Record<string, unknown>)[target.key] = part.text;
+  });
+}
+
+/**
+ * 把占位符说明注入首条 system 消息的提示分段。
+ *
+ * 用独立 section 而不是拼进既有分段：宿主会把同名 section 覆盖合并，独立键
+ * 不会与 Pi 自己的提示段互相覆盖。
+ */
+function injectRehydraInstruction(messages: AgentMessage[], instruction: string): void {
+  for (const message of messages) {
+    if ((message as { role?: string }).role !== "system") continue;
+    const target = message as { sections?: Record<string, string | null> };
+    // 旧式 system 消息可能只有 content、没有 sections；补建一个空对象即可，
+    // 宿主会把 content 与各 section 一起拼进提示。
+    if (target.sections === undefined || target.sections === null) {
+      target.sections = {};
+    }
+    target.sections[REHYDRA_SECTION] = instruction;
+    return;
+  }
+}
 function textPartFromContent(part: unknown): ScrubPart {
   if (part === null || typeof part !== "object") return {};
   const obj = part as Record<string, unknown>;
@@ -739,19 +933,39 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
     // 映射，以便在 scrub 后把改动写回到原始消息的 `content` 字段。
     const rewrite = normalizeMessagesForScrub(event.messages);
     const startedAt = Date.now();
-    const stats = await scrubCore(
+    let stats: ScrubCoreStats;
+    try {
+      stats = await scrubCore(
+        rewrite.scrubMessages,
+        state.resolveSession(sessionId),
+        host,
+        scrubOptions,
+        state.recorder.enabled
+          ? {
+              includeOriginal: state.recorder.includeOriginal,
+              maxRecordBytes: state.recorder.maxRecordBytes,
+            }
+          : undefined,
+      );
+    } catch (error) {
+      // 宿主会吞掉处理器异常并继续用未脱敏内容发请求，所以在这里自己兜住：
+      // 内容保持原样，本次请求照常发出，但要留下可定位的告警。
+      state.log.warn("masking failed; request may contain unmasked content", {
+        event: "context_with_system",
+        sessionId,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      return { messages: event.messages };
+    }
+    restoreMessagesFromScrub(
+      event.messages,
       rewrite.scrubMessages,
-      state.resolveSession(sessionId),
-      host,
-      scrubOptions,
-      state.recorder.enabled
-        ? {
-            includeOriginal: state.recorder.includeOriginal,
-            maxRecordBytes: state.recorder.maxRecordBytes,
-          }
-        : undefined,
+      rewrite.userStringContent,
+      rewrite.fieldWrites,
     );
-    restoreMessagesFromScrub(event.messages, rewrite.scrubMessages, rewrite.userStringContent);
+    if (stats.scrubbed > 0) {
+      injectRehydraInstruction(event.messages, state.rehydraInstruction);
+    }
     if (stats.detectionErrors !== undefined) warnDegradedOnce(state, stats.detectionErrors);
     recordRequest(state, sessionId, "context", startedAt, stats);
     // 共享核心就地改写了 event.messages；显式回传，保证 Pi 使用改写后的数组。
@@ -761,7 +975,14 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
 
   pi.on("tool_call", async (event: ToolCallEvent, ctx) => {
     const state = runtime.state;
-    if (state === undefined) return undefined;
+    if (state === undefined) {
+      // 扩展尚未初始化（初始化失败或尚未完成）：没有脱敏映射，工具可能拿到
+      // 未还原的占位符参数，直接阻止执行。
+      return {
+        block: true,
+        reason: "Rehydra 扩展未初始化，已阻止工具执行。",
+      };
+    }
     const session = state.resolveSession(ctx.sessionManager.getSessionId());
     // 严格还原：还原不全就阻断，绝不把 `<PII .../>` 当真实值交给工具执行。
     // 宿主契约（已核对 pi 运行时）：`{block: true}` 会直接产出 error 工具结果、不执行工具。
@@ -824,30 +1045,43 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
             part.type === "text" &&
             typeof part.text === "string"
           ) {
-            const anonymized = await session.anonymize(
-              part.text,
-              state.locale,
-              state.policy,
-              state.recorder.enabled
-                ? {
-                    includeOriginal: state.recorder.includeOriginal,
-                    onEntity: (entity) => {
-                      hits.push({
-                        type: entity.type,
-                        detector: entity.recognizer ?? "unknown",
-                        placeholder: entity.replaced,
-                        length: entity.end - entity.start,
-                        start: entity.start,
-                        end: entity.end,
-                        ...(entity.original === undefined
-                          ? {}
-                          : { original: entity.original }),
-                      });
-                    },
-                  }
-                : undefined,
-              run,
-            );
+            let anonymized;
+            try {
+              anonymized = await session.anonymize(
+                part.text,
+                state.locale,
+                state.policy,
+                state.recorder.enabled
+                  ? {
+                      includeOriginal: state.recorder.includeOriginal,
+                      onEntity: (entity): void => {
+                        hits.push({
+                          type: entity.type,
+                          detector: entity.recognizer ?? "unknown",
+                          placeholder: entity.replaced,
+                          length: entity.end - entity.start,
+                          start: entity.start,
+                          end: entity.end,
+                          ...(entity.original === undefined
+                            ? {}
+                            : { original: entity.original }),
+                        });
+                      },
+                    }
+                  : undefined,
+                run,
+              );
+            } catch (error) {
+              // 宿主会吞掉处理器异常并把原始内容交给模型，所以在这里兜住：
+              // 该块保持原样，但要留下可定位的告警。
+              state.log.warn("masking failed; tool result may reach the model unmasked", {
+                event: "tool_result",
+                tool: event.toolName,
+                reason: error instanceof Error ? error.message : String(error),
+              });
+              scrubbed.push(part);
+              continue;
+            }
             if (anonymized.integrity !== undefined) integrity = anonymized.integrity;
             for (const entry of anonymized.detectionErrors ?? []) {
               if (!detectionErrors.some((item) => item.code === entry.code)) {

@@ -10,11 +10,21 @@
  */
 
 /** Pi 对话中的一条消息（本扩展只关心 role / content / toolCallId）。 */
+/** Pi 对话中的一条消息。 */
 export interface AgentMessage {
   role?: string;
   content?: unknown;
   toolCallId?: string;
   timestamp?: number;
+/** system 消息的提示分段；`null` 表示该段被移除。 */
+  sections?: Record<string, string | null>;
+/** bashExecution 消息的命令与输出。 */
+  command?: string;
+  output?: string;
+/** branchSummary / compactionSummary 消息的摘要正文。 */
+  summary?: string;
+/** custom 消息的扩展标识。 */
+  customType?: string;
   [key: string]: unknown;
 }
 

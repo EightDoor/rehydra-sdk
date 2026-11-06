@@ -48,6 +48,10 @@ Every key under `rehydra` is an extension option: `envFiles`, `redactValues`, `m
 | `message_end` | Rewrite the final assistant message so PII tags are replaced with real values |
 | `session_shutdown` | Dispose of the anonymizer and session registry |
 
+Masked message roles: `user`, `assistant`, `toolResult`, `system` (its `content` and prompt sections, except the tool declarations section), `bashExecution` (command and output), `custom`, `branchSummary`, and `compactionSummary` — exactly the roles Pi turns into model input. When the current request replaced anything, the placeholder guidance is injected as its own prompt section, so the model treats placeholders as opaque pass-through values.
+
+On failure: an uninitialized extension blocks tool execution. A single masking failure does not abort the request — Pi swallows handler errors and sends the unmasked content anyway, so the extension catches them and logs a warning carrying only the event name and reason, never the content.
+
 ## Masking records and comparison
 
 Once enabled, you can check request by request what was intercepted and what the model actually received:
@@ -72,6 +76,7 @@ Any recording failure (unwritable directory, symlink, half-written line) only pr
 ## Limitations
 - Tool-argument rehydration is strict: when a tag is absent from this session's map (or the map is missing, or decryption fails), the tool call is blocked rather than run with `<PII .../>` as a real value. A placeholder can only be restored from the same session's map; the default map is in memory, so tags from before a process restart cannot be restored.
 
+- Session maps are cached in-process to avoid repeated decryption. The cache is shared per storage instance and session id, so every session instance on the same storage sees the same map, and a streaming save invalidates it. Only another process, or a different storage instance over the same underlying data, can write a map this process's cache will not notice.
 - Model calls that bypass these hooks (rare, e.g. user-initiated notes) are not intercepted.
 - `URL`, `IP_ADDRESS`, `BIC_SWIFT`, `POSTAL_CODE` and `DATE` are disabled by default: recognizers that fire on shape alone misfire badly in code and documents. Restore them with `disableTypes: ["URL", "IP_ADDRESS"]`; a bank identifier still needs a full banking context word nearby.
 - Only the values of sensitive fields in an `.env` file enter the global known-value set; project names and ports are not replaced later in the text. Explicitly configured `redactValues` are not affected by that filter.
