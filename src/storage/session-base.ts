@@ -67,7 +67,23 @@ function sameKey(a: Uint8Array, b: Uint8Array): boolean {
 interface SessionState {
   tail: Promise<void>;
   cache: SessionMapCache | null;
+  /**
+   * 每次缓存失效都自增。读操作在 await 前记下版本，回填缓存前比对：
+   * 期间若被流式写入等外部路径失效过，就不能把旧快照塞回缓存。
+   */
+  version: number;
+  /** 正在排队或执行中的任务数，用于判断该条目能否被回收。 */
+  pending: number;
 }
+
+/**
+ * 单个存储实例上保留多少条会话状态。
+ *
+ * proxy 每请求新建会话，条目只增不减会让内存随历史会话数增长；超过上限时
+ * 回收空闲条目（不回收正在排队的，避免拆散同会话队列）。被回收的条目下次
+ * 调用会重新从存储读取，不影响正确性。
+ */
+const MAX_TRACKED_SESSIONS = 64;
 
 /**
  * 按存储实例记录的会话状态。
@@ -86,21 +102,54 @@ function stateFor(storage: Storage, sessionId: string): SessionState {
   }
   let state = bySession.get(sessionId);
   if (state === undefined) {
-    state = { tail: Promise.resolve(), cache: null };
+    state = { tail: Promise.resolve(), cache: null, version: 0, pending: 0 };
     bySession.set(sessionId, state);
   }
   return state;
 }
 
+/** 回收空闲条目，直到回到上限以内。 */
+function evictIdleSessions(bySession: Map<string, SessionState>, keep: string): void {
+  if (bySession.size <= MAX_TRACKED_SESSIONS) return;
+  // Map 保持插入顺序，从最久未使用的开始是最省事的近似 LRU。
+  for (const [id, state] of bySession) {
+    if (bySession.size <= MAX_TRACKED_SESSIONS) return;
+    if (id !== keep && state.pending === 0) bySession.delete(id);
+  }
+}
+
 /**
  * 丢弃某会话的缓存。
  *
- * 供绕过会话实例直接写存储的路径使用（例如流式脱敏自己保存映射），避免
- * 缓存代表一个已经被改写的旧状态。
+ * 供绕过会话实例直接写存储的路径使用（例如流式脱敏自己保存映射，或调用方
+ * 直接用 `PIIStorageProvider.delete` / `cleanup`），避免缓存继续代表一个已经
+ * 被改写的旧状态。
  */
 export function invalidateSessionMapCache(storage: Storage, sessionId: string): void {
   const state = sessionStates.get(storage)?.get(sessionId);
-  if (state !== undefined) state.cache = null;
+  if (state !== undefined) {
+    state.cache = null;
+    state.version += 1;
+  }
+}
+
+/**
+ * 当前为该存储保留的会话状态条目数（诊断与测试用）。
+ *
+ * 用于确认上限回收生效，不作为业务指标。
+ */
+export function trackedSessionCount(storage: Storage): number {
+  return sessionStates.get(storage)?.size ?? 0;
+}
+
+/** 丢弃某个存储上全部会话的缓存（`cleanup` 这类批量删除之后使用）。 */
+export function invalidateStorageCaches(storage: Storage): void {
+  const bySession = sessionStates.get(storage);
+  if (bySession === undefined) return;
+  for (const state of bySession.values()) {
+    state.cache = null;
+    state.version += 1;
+  }
 }
 
 /**
@@ -108,13 +157,25 @@ export function invalidateSessionMapCache(storage: Storage, sessionId: string): 
  *
  * 已知限制：锁只在进程内生效。多进程共用同一个 SQLite 文件时，各进程持有
  * 各自的存储实例，跨进程写入仍可能互相覆盖。
+ *
+ * 流式脱敏直接持有存储句柄，它的写盘也要排进这条队，否则会与进行中的
+ * 脱敏/还原交错，让旧快照覆盖新映射。
  */
+export async function withSessionLock<T>(
+  storage: Storage,
+  sessionId: string,
+  task: () => Promise<T>,
+): Promise<T> {
+  return runExclusive(storage, sessionId, task);
+}
+
 async function runExclusive<T>(
   storage: Storage,
   sessionId: string,
   task: () => Promise<T>,
 ): Promise<T> {
   const state = stateFor(storage, sessionId);
+  state.pending += 1;
   // 队尾永不 reject，所以直接续接即可：本次任务在上一任务结束后开始。
   const running = state.tail.then(task);
   // 队尾只关心"已结束"，不关心成败；失败由 running 交给调用方。
@@ -122,7 +183,13 @@ async function runExclusive<T>(
     () => undefined,
     () => undefined,
   );
-  return running;
+  try {
+    return await running;
+  } finally {
+    state.pending -= 1;
+    const bySession = sessionStates.get(storage);
+    if (bySession !== undefined) evictIdleSessions(bySession, sessionId);
+  }
 }
 
 /**
@@ -219,7 +286,8 @@ export class AnonymizerSessionImpl implements AnonymizerSession {
         createdAt,
         entityCounts: existingEntityCounts,
         persisted,
-        key,
+        // 快照独立副本：provider 可能复用同一个数组，原地改 key 会绕过校验。
+        key: new Uint8Array(key),
       };
     }
 
@@ -290,7 +358,7 @@ export class AnonymizerSessionImpl implements AnonymizerSession {
       createdAt,
       entityCounts: mergedEntityCounts,
       persisted: true,
-      key,
+      key: new Uint8Array(key),
     };
 
     return result;
@@ -320,6 +388,10 @@ export class AnonymizerSessionImpl implements AnonymizerSession {
       );
     }
 
+    // 读取期间可能有外部写入（流式脱敏、直接调 provider）失效过缓存。
+    // 记下版本，回填前比对，避免把旧快照塞回缓存。
+    const version = state.version;
+
     // Load from storage
     const stored = await this.storage.load(this.sessionId);
     if (stored === null) {
@@ -331,13 +403,15 @@ export class AnonymizerSessionImpl implements AnonymizerSession {
 
     // Decrypt the PII map
     const piiMap = await decryptPIIMap(stored.piiMap, key);
-    state.cache = {
-      piiMap,
-      createdAt: stored.metadata.createdAt,
-      entityCounts: stored.metadata.entityCounts,
-      persisted: true,
-      key,
-    };
+    if (state.version === version) {
+      state.cache = {
+        piiMap,
+        createdAt: stored.metadata.createdAt,
+        entityCounts: stored.metadata.entityCounts,
+        persisted: true,
+        key: new Uint8Array(key),
+      };
+    }
 
     // Rehydrate the text
     return rehydrateText(text, piiMap, false, this.anonymizer.resolvedTagFormat);

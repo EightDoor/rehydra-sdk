@@ -4,6 +4,10 @@
  */
 
 import type { EncryptedPIIMap } from "../types/index.js";
+import {
+  invalidateSessionMapCache,
+  invalidateStorageCaches,
+} from "./session-base.js";
 import type {
   PIIStorageProvider,
   PIIMapMetadata,
@@ -69,7 +73,11 @@ export class InMemoryPIIStorageProvider implements PIIStorageProvider {
    * Delete a PII map
    */
   delete(conversationId: string): Promise<boolean> {
-    return Promise.resolve(this.storage.delete(conversationId));
+    const deleted = this.storage.delete(conversationId);
+    // 直接调 provider 删除的调用方不会经过会话对象，缓存必须在这里失效，
+    // 否则删除后还能从缓存还原出已删除的值。
+    invalidateSessionMapCache(this, conversationId);
+    return Promise.resolve(deleted);
   }
 
   /**
@@ -119,6 +127,7 @@ export class InMemoryPIIStorageProvider implements PIIStorageProvider {
       }
     }
 
+    if (deleted > 0) invalidateStorageCaches(this);
     return Promise.resolve(deleted);
   }
 

@@ -4,6 +4,10 @@
  */
 
 import type { EncryptedPIIMap } from "../types/index.js";
+import {
+  invalidateSessionMapCache,
+  invalidateStorageCaches,
+} from "./session-base.js";
 import type {
   PIIStorageProvider,
   PIIMapMetadata,
@@ -271,6 +275,8 @@ export class SQLitePIIStorageProvider implements PIIStorageProvider {
       "DELETE FROM pii_maps WHERE conversation_id = ?"
     ).run(conversationId);
 
+    // 直接调 provider 删除时缓存不会自动感知，必须在这里失效。
+    invalidateSessionMapCache(this, conversationId);
     return Promise.resolve(result.changes > 0);
   }
 
@@ -338,6 +344,7 @@ export class SQLitePIIStorageProvider implements PIIStorageProvider {
       "DELETE FROM pii_maps WHERE created_at < ?"
     ).run(olderThan.getTime());
 
+    if (result.changes > 0) invalidateStorageCaches(this);
     return Promise.resolve(result.changes);
   }
 

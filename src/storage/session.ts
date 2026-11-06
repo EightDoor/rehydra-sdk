@@ -7,6 +7,7 @@ export { type IAnonymizer } from "./session-base.js";
 import {
   AnonymizerSessionImpl as BaseSessionImpl,
   invalidateSessionMapCache,
+  withSessionLock,
 } from "./session-base.js";
 import type { KeyProvider } from "../crypto/index.js";
 import { decryptPIIMap } from "../crypto/index.js";
@@ -17,25 +18,28 @@ import type { StreamConfig } from "../streaming/types.js";
 import type { IAnonymizer } from "./session-base.js";
 
 /**
- * 包装存储：写盘成功后丢弃该会话的缓存。
+ * 包装存储：把流式写盘排进会话队列，并在写完后丢弃缓存。
  *
- * 流式脱敏直接持有存储句柄，不经过会话队列，所以缓存只能在这里失效。
+ * 流式脱敏直接持有存储句柄。若它的保存发生在队列之外，就可能与进行中的
+ * 还原交错，让旧快照覆盖新映射，因此这里把写入也送进同一条队。
  */
-function withCacheInvalidation(
+function withSessionAwareness(
   storage: PIIStorageProvider,
   sessionId: string,
 ): PIIStorageProvider {
   return {
-    save: async (id, piiMap, metadata): Promise<void> => {
-      await storage.save(id, piiMap, metadata);
-      invalidateSessionMapCache(storage, sessionId);
-    },
+    save: (id, piiMap, metadata): Promise<void> =>
+      withSessionLock(storage, sessionId, async () => {
+        await storage.save(id, piiMap, metadata);
+        invalidateSessionMapCache(storage, sessionId);
+      }),
     load: (id) => storage.load(id),
-    delete: async (id): Promise<boolean> => {
-      const deleted = await storage.delete(id);
-      invalidateSessionMapCache(storage, sessionId);
-      return deleted;
-    },
+    delete: (id): Promise<boolean> =>
+      withSessionLock(storage, sessionId, async () => {
+        const deleted = await storage.delete(id);
+        invalidateSessionMapCache(storage, sessionId);
+        return deleted;
+      }),
     exists: (id) => storage.exists(id),
     list: (options) => storage.list(options),
     cleanup: (olderThan) => storage.cleanup(olderThan),
@@ -65,7 +69,7 @@ export class AnonymizerSessionImpl extends BaseSessionImpl {
 
     // 流自己直接写存储，绕过了会话队列；每次写盘后都要丢弃缓存，
     // 否则后续 anonymize / rehydrate 会基于流写入之前的旧映射。
-    const storage = withCacheInvalidation(this.storage, this.sessionId);
+    const storage = withSessionAwareness(this.storage, this.sessionId);
 
     return new AnonymizerStream(
       this.anonymizer,

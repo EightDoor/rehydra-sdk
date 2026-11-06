@@ -12,7 +12,10 @@ import {
   InMemoryPIIStorageProvider,
   type Anonymizer,
 } from "../../src/index.js";
-import { invalidateSessionMapCache } from "../../src/storage/session-base.js";
+import {
+  invalidateSessionMapCache,
+  trackedSessionCount,
+} from "../../src/storage/session-base.js";
 
 /** 拼接构造，避免源码里出现真实邮箱字面量与裸标签前缀。 */
 function emailAt(local: string): string {
@@ -201,5 +204,106 @@ describe("会话映射缓存", () => {
     } finally {
       await other.dispose();
     }
+  });
+
+  // 回归（审查二轮 1）：直接调 provider 的 delete/cleanup 也要让缓存失效。
+  it("直接调 storage.delete 之后不再从缓存还原", async () => {
+    const sessionId = "cache-provider-delete";
+    const target = emailAt("gone2");
+    const session = anonymizer.session(sessionId);
+    const result = await session.anonymize(`联系人 ${target}`);
+    await session.rehydrate(result.anonymizedText);
+
+    await storage.delete(sessionId);
+
+    const fresh = anonymizer.session(sessionId);
+    await expect(fresh.rehydrate(result.anonymizedText)).rejects.toThrow(
+      /No PII map found/,
+    );
+  });
+
+  it("直接调 storage.cleanup 之后不再从缓存还原", async () => {
+    const sessionId = "cache-provider-cleanup";
+    const target = emailAt("aged");
+    const session = anonymizer.session(sessionId);
+    const result = await session.anonymize(`联系人 ${target}`);
+
+    // 用一个未来时间点清掉全部记录。
+    await storage.cleanup(new Date(Date.now() + 1000));
+
+    const fresh = anonymizer.session(sessionId);
+    await expect(fresh.rehydrate(result.anonymizedText)).rejects.toThrow(
+      /No PII map found/,
+    );
+  });
+
+  // 回归（审查二轮 3）：provider 原地改密钥数组不得绕过 key 校验。
+  it("原地修改密钥数组后不复用旧缓存", async () => {
+    const sessionId = "cache-key-mutation";
+    const mutableKey = new InMemoryKeyProvider();
+    const sharedStorage = new InMemoryPIIStorageProvider();
+    const first = createAnonymizer({
+      ner: { mode: "disabled" },
+      piiStorageProvider: sharedStorage,
+      keyProvider: mutableKey,
+    });
+    await first.initialize();
+    try {
+      await first.session(sessionId).anonymize(`联系人 ${emailAt("mut")}`);
+
+      // 原地翻转密钥字节：缓存里存的是快照，因此必须判定为不匹配。
+      const key = await mutableKey.getKey();
+      key[0] = (key[0] ?? 0) ^ 0xff;
+
+      // 关键在于不能静默返回明文：解密失败应直接抛错。
+      await expect(
+        first.session(sessionId).rehydrate(`联系人 ${emailAt("mut")}`),
+      ).rejects.toBeInstanceOf(Error);
+    } finally {
+      await first.dispose();
+    }
+  });
+
+  // 回归（审查二轮 4）：会话状态要有上限，不能随历史会话无限增长。
+  it("会话状态条目数受上限约束", async () => {
+    const target = emailAt("b0");
+    const firstResult = await anonymizer
+      .session("bounded-0")
+      .anonymize(`联系人 ${target}`);
+
+    for (let i = 1; i < 120; i += 1) {
+      await anonymizer.session(`bounded-${i}`).anonymize(`联系人 ${emailAt(`b${i}`)}`);
+    }
+
+    // 条目数必须有上限，不能随历史会话数无限增长。
+    expect(trackedSessionCount(storage)).toBeLessThanOrEqual(64);
+
+    // 被回收的条目重新从存储读取，功能不受影响。
+    const restored = await anonymizer
+      .session("bounded-0")
+      .rehydrate(firstResult.anonymizedText);
+    expect(restored).toContain(target);
+  });
+
+  // 回归（审查二轮 2）：流式写盘与进行中的还原不得交错出旧快照。
+  it("流式写入后普通脱敏不会覆盖流新增的映射", async () => {
+    const sessionId = "cache-stream-interop";
+    const session = anonymizer.session(sessionId);
+
+    // 先建立一份基线映射。
+    await session.anonymize(`联系人 ${emailAt("base")}`);
+
+    // 流式脱敏写入新实体。
+    const stream = await session.createStream();
+    stream.write(`联系人 ${emailAt("streamed")}`);
+    await new Promise<void>((resolve) => stream.end(() => resolve()));
+
+    // 之后普通脱敏必须能看到流写入的实体，不能覆盖它。
+    const after = await session.anonymize(`联系人 ${emailAt("later")}`);
+    expect(after.anonymizedText).toContain(TAG_OPEN);
+
+    const restored = await session.rehydrate(`联系人 ${emailAt("streamed")}`);
+    // 若流的映射被覆盖，这里会拿不到原值。
+    expect(restored).toContain(emailAt("streamed"));
   });
 });

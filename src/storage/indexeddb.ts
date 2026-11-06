@@ -4,6 +4,10 @@
  */
 
 import type { EncryptedPIIMap } from "../types/index.js";
+import {
+  invalidateSessionMapCache,
+  invalidateStorageCaches,
+} from "./session-base.js";
 import type {
   PIIStorageProvider,
   PIIMapMetadata,
@@ -216,6 +220,8 @@ export class IndexedDBPIIStorageProvider implements PIIStorageProvider {
       };
 
       transaction.oncomplete = (): void => {
+        // 直接调 provider 删除时缓存不会自动感知，必须在这里失效。
+        invalidateSessionMapCache(this, conversationId);
         resolve(true);
       };
     });
@@ -337,6 +343,7 @@ export class IndexedDBPIIStorageProvider implements PIIStorageProvider {
       };
 
       transaction.oncomplete = (): void => {
+        if (deleted > 0) invalidateStorageCaches(this);
         resolve(deleted);
       };
     });
