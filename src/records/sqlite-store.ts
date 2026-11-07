@@ -63,6 +63,8 @@ export type RecordStatus = "ok" | "degraded" | "failed" | "blocked";
 type Log = (level: "warn", message: string, extra?: Record<string, unknown>) => void;
 
 const DB_FILE = "records.sqlite";
+/** 单条 DELETE 的 id 个数；SQLITE_MAX_VARIABLE_NUMBER 默认 32766，留足余量。 */
+const DELETE_BATCH = 500;
 
 /**
  * Windows 的 chmod 只映射到只读位，0o700 / 0o600 不会生效；那里的保护来自
@@ -87,8 +89,11 @@ const SCHEMA = `
     bytes INTEGER NOT NULL,
     created_at INTEGER NOT NULL
   );
-  CREATE INDEX IF NOT EXISTS idx_masking_records_created ON masking_records(created_at);
+  CREATE INDEX IF NOT EXISTS idx_masking_records_order ON masking_records(created_at, id);
   CREATE INDEX IF NOT EXISTS idx_masking_records_session ON masking_records(session_id, created_at);
+  -- 旧的单列索引换成 (created_at, id)：裁剪按 (created_at, id) 键集翻页，
+  -- 单列索引下这个比较用不上索引 seek。DROP IF EXISTS 之后是无操作。
+  DROP INDEX IF EXISTS idx_masking_records_created;
 `;
 
 /**
@@ -136,6 +141,8 @@ export class MaskingRecordStore {
   private dropped = 0;
   private sequence = 0;
   private closed = false;
+  /** 增量回收是否可用；不可用时退化为整库 VACUUM。 */
+  private incremental = true;
 
   constructor(options: RecordStoreOptions, log: Log) {
     this.options = options;
@@ -367,6 +374,7 @@ export class MaskingRecordStore {
       const db = new DatabaseSync(this.path);
       db.exec("PRAGMA journal_mode = WAL");
       db.exec("PRAGMA busy_timeout = 250");
+      this.enableIncrementalVacuum(db);
       db.exec("PRAGMA secure_delete = ON");
       db.exec(SCHEMA);
       this.tightenFileModes();
@@ -417,43 +425,166 @@ export class MaskingRecordStore {
     const expired = db
       .prepare("DELETE FROM masking_records WHERE created_at < ?")
       .run(cutoff).changes;
-    let deleted = expired > 0;
-
-    // keepBytes 管的是磁盘占用：payload 计数不含索引与 WAL，且 DELETE 不会缩小文件。
-    // 所以按实际文件大小判断，逐批删最旧记录，直到达标或用完记录。
-    for (let round = 0; round < 16; round += 1) {
-      if (this.diskBytes() <= this.options.keepBytes) break;
-      const rows = db
-        .prepare("SELECT id FROM masking_records ORDER BY created_at ASC, id ASC LIMIT 64")
-        .all() as Array<{ id: string }>;
-      if (rows.length === 0) break;
-      const placeholders = rows.map(() => "?").join(",");
-      db.prepare(`DELETE FROM masking_records WHERE id IN (${placeholders})`).run(
-        ...rows.map((row) => row.id),
-      );
-      deleted = true;
-    }
-
     // 删过就必须回收：WAL 模式下 VACUUM 的结果要再 checkpoint 才落回主库文件，
     // 否则库文件停在历史高水位，把整个容量预算吃光。
-    if (deleted) this.reclaim();
+    if (expired > 0 && !this.shrink()) return;
+    this.trimToBytes(db);
   }
 
   /**
-   * 回收已删除记录占用的磁盘空间。
+   * 容量裁剪：只删够填平超限量的最旧记录，一次写入不做整库 VACUUM。
    *
-   * `DELETE` 只是把页标记为可复用，库文件不会变小；`keepBytes` 管的是磁盘占用，
-   * 所以裁剪后按实际文件大小决定是否 VACUUM，并把 WAL 截断。
+   * 顺序不能变：先截断 WAL、再归还空页，文件大小才接近存活数据；否则 WAL 和
+   * 空页会把"超限量"放大到超过全部记录字节，删多也填不平，最后把库删空。
    */
-  private reclaim(): void {
+  private trimToBytes(db: SqliteDatabase): void {
+    const cap = this.options.keepBytes;
+    // 每轮按比例估算删多少，一轮删不够就下一轮继续；上限只为防死循环，
+    // 正常几轮收敛，接近容量下限时可能要多删几次才落到 cap 以下。
+    for (let round = 0; round < 64; round += 1) {
+      if (this.diskBytes() <= cap) return;
+      if (!this.checkpoint()) return;
+      if (this.diskBytes() <= cap) return;
+      if (!this.shrink()) return;
+      const usage = this.diskBytes();
+      if (usage <= cap) return;
+      // 记录字节只是载荷，磁盘上还有索引与页开销，按同一比例折算才删得准。
+      const excess = Math.ceil(((usage - cap) * this.liveBytes(db)) / usage);
+      if (excess <= 0) return;
+      const victims = this.oldestWithin(db, excess);
+      if (victims.length === 0) return;
+      this.deleteByIds(db, victims);
+      // 回收失败时磁盘测不准，继续删会误伤未过期记录，先停手。
+      if (!this.shrink()) return;
+    }
+  }
+
+  /** 按 id 删除；一次 DELETE 的参数个数受 SQLITE_MAX_VARIABLE_NUMBER 限制，必须分批。 */
+  private deleteByIds(db: SqliteDatabase, ids: string[]): void {
+    for (let i = 0; i < ids.length; i += DELETE_BATCH) {
+      const chunk = ids.slice(i, i + DELETE_BATCH);
+      const placeholders = chunk.map(() => "?").join(",");
+      db.prepare(`DELETE FROM masking_records WHERE id IN (${placeholders})`).run(...chunk);
+    }
+  }
+
+  /**
+   * 从最旧开始挑累计字节不超过预算的记录 id。
+   *
+   * 不越过预算：一条记录的 `bytes` 只是载荷，物理开销可能更大或更小，
+   * 多挑一条就可能把本来放得下的新记录也删掉。宁可下一轮再删。
+   *
+   * 用 (created_at, id) 键集翻页而不是 OFFSET：OFFSET 每页都要重新跳过前面的
+   * 行，几万条记录要一次裁掉时会退化成 O(n²)，卡在同步写入路径上。
+   */
+  private oldestWithin(db: SqliteDatabase, excess: number): string[] {
+    const victims: string[] = [];
+    let freed = 0;
+    let cursor: { createdAt: number; id: string } | undefined;
+    for (;;) {
+      const rows = (
+        cursor === undefined
+          ? db
+              .prepare(
+                "SELECT id, bytes, created_at AS createdAt FROM masking_records ORDER BY created_at ASC, id ASC LIMIT 64",
+              )
+              .all()
+          : db
+              .prepare(
+                `SELECT id, bytes, created_at AS createdAt FROM masking_records
+                 WHERE (created_at, id) > (?, ?)
+                 ORDER BY created_at ASC, id ASC LIMIT 64`,
+              )
+              .all(cursor.createdAt, cursor.id)
+      ) as Array<{ id: string; bytes: number; createdAt: number }>;
+      if (rows.length === 0) break;
+      for (const row of rows) {
+        const bytes = Math.max(Number(row.bytes), 1);
+        // 预算不够就收手；游标只跟着真正取走的行走，否则会跳过整页。
+        if (victims.length > 0 && freed + bytes > excess) return victims;
+        victims.push(row.id);
+        freed += bytes;
+        cursor = { createdAt: Number(row.createdAt), id: row.id };
+        if (freed >= excess) return victims;
+      }
+    }
+    return victims;
+  }
+
+  /**
+   * 整库 VACUUM 并截断 WAL。只在显式清理时用：大库上要重写整个文件。
+   *
+   * 返回是否成功：失败时磁盘数字不可信，调用方不能再据此继续删记录。
+   */
+  private reclaim(): boolean {
     const db = this.db;
-    if (db === null) return;
+    if (db === null) return false;
     try {
-      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
       db.exec("VACUUM");
-      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     } catch (error) {
       this.warnWrite(error);
+      return false;
+    }
+    return this.checkpoint();
+  }
+
+  /**
+   * 截断 WAL，返回是否真的截断成功。
+   *
+   * `PRAGMA wal_checkpoint` 遇到别的连接持有读事务时以 `busy=1` 返回而不抛错；
+   * 只看异常会把"没截断"当成成功，再按虚高的占用继续删记录。
+   */
+  private checkpoint(): boolean {
+    const db = this.db;
+    if (db === null) return false;
+    try {
+      const row = db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as
+        | { busy: number }
+        | undefined;
+      return row === undefined || Number(row.busy) === 0;
+    } catch (error) {
+      this.warnWrite(error);
+      return false;
+    }
+  }
+
+  /**
+   * 只把已删记录留下的空页还给系统，不重写整库。
+   *
+   * 依赖打开库时启用的 `auto_vacuum = INCREMENTAL`；没有它这里不生效，
+   * 文件会停在高水位，裁剪看不出效果。
+   */
+  private shrink(): boolean {
+    if (!this.incremental) return this.reclaim();
+    const db = this.db;
+    if (db === null) return false;
+    try {
+      db.exec("PRAGMA incremental_vacuum");
+    } catch (error) {
+      this.warnWrite(error);
+      return false;
+    }
+    return this.checkpoint();
+  }
+
+  /**
+   * 打开库时启用增量回收。
+   *
+   * `auto_vacuum` 只在库文件创建时生效，已有库必须 VACUUM 一次才能改过来；
+   * 这是一次性成本（300 MiB 库约几秒），换来之后每次裁剪不必整库重写。
+   */
+  private enableIncrementalVacuum(db: SqliteDatabase): void {
+    const row = db.prepare("PRAGMA auto_vacuum").get() as { auto_vacuum: number } | undefined;
+    if (Number(row?.auto_vacuum) === 2) return;
+    try {
+      db.exec("PRAGMA auto_vacuum = INCREMENTAL");
+      db.exec("VACUUM");
+    } catch (error) {
+      // 别的连接占着库时转换会失败；退化为每次裁剪做整库 VACUUM，功能不受影响。
+      this.incremental = false;
+      this.log("warn", "failed to enable incremental vacuum; falling back to full VACUUM", {
+        reason: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -474,6 +605,13 @@ export class MaskingRecordStore {
     if (this.warned) return;
     this.warned = true;
     this.log("warn", message);
+  }
+  /** 存活记录的载荷字节总数。 */
+  private liveBytes(db: SqliteDatabase): number {
+    const row = db.prepare("SELECT COALESCE(SUM(bytes), 0) AS total FROM masking_records").get() as
+      | { total: number }
+      | undefined;
+    return Number(row?.total ?? 0);
   }
 
   private warnWrite(error: unknown): void {

@@ -7,6 +7,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  DEFAULT_RECORD_OPTIONS,
   anonymizerConfigFromOptions,
   normalizeRehydraOptions,
   policyFromOptions,
@@ -72,6 +73,19 @@ describe("normalizeRehydraOptions", () => {
       policy: { allowlistTerms: 42 },
     });
     expect(() => policyFromOptions(options)).toThrow(/policy\.allowlistTerms/);
+  });
+});
+
+describe("record retention defaults", () => {
+  it("keeps records for 7 days with a 300 MiB cap by default", () => {
+    expect(DEFAULT_RECORD_OPTIONS.keepDays).toBe(7);
+    expect(DEFAULT_RECORD_OPTIONS.keepBytes).toBe(300 * 1024 * 1024);
+  });
+
+  it("honours explicit retention settings", () => {
+    const record = normalizeRehydraOptions({ record: { keepDays: 3, keepBytes: 1024 } }).record;
+    expect(record?.keepDays).toBe(3);
+    expect(record?.keepBytes).toBe(1024);
   });
 });
 

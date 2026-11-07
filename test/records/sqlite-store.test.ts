@@ -6,7 +6,7 @@ import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
+import { createRequire } from "node:module";
 import { MaskingRecordStore, statusOf } from "../../src/records/sqlite-store.js";
 import type { MaskingRecord } from "../../src/records/types.js";
 
@@ -308,6 +308,203 @@ describe("MaskingRecordStore", () => {
     // 过期记录删掉后，磁盘占用必须跟着降下来，而不是停在高水位。
     expect(await diskUsage(small)).toBeLessThanOrEqual(cap);
     capped.close();
+    await rm(small, { recursive: true, force: true });
+  });
+
+  it("keeps the newest records when trimming by capacity", async () => {
+    const cap = 256 * 1024;
+    const small = await mkdtemp(join(tmpdir(), "rehydra-trim-"));
+    const capped = new MaskingRecordStore(
+      {
+        enabled: true,
+        includeOriginal: true,
+        keepDays: 7,
+        keepBytes: cap,
+        maxRecordBytes: cap,
+        dir: small,
+      },
+      () => undefined,
+    );
+    for (let i = 0; i < 80; i += 1) {
+      capped.add(
+        record(`14-${i}`, {
+          snapshot: { before: "x".repeat(8_000), after: "y".repeat(8_000) },
+        }),
+      );
+    }
+    capped.flush();
+
+    const ids = capped.query({ limit: 200 }).records.map((row) => row.id);
+    // 超标只淘汰最旧的：最新一条必须还在，也不能一次把库清空。
+    expect(ids).toContain("14-79");
+    expect(ids).not.toContain("14-0");
+    expect(ids.length).toBeGreaterThan(5);
+    expect(await diskUsage(small)).toBeLessThanOrEqual(cap);
+    capped.close();
+    await rm(small, { recursive: true, force: true });
+  });
+
+  it("stops trimming when the cap cannot hold any record", async () => {
+    const small = await mkdtemp(join(tmpdir(), "rehydra-tiny-"));
+    const capped = new MaskingRecordStore(
+      {
+        enabled: true,
+        includeOriginal: true,
+        keepDays: 7,
+        keepBytes: 1,
+        maxRecordBytes: 1024,
+        dir: small,
+      },
+      () => undefined,
+    );
+    // 容量比库本身的固定开销还小：删空后必须停下，不能死循环。
+    capped.add(record("15-1"));
+    capped.add(record("15-2"));
+    expect(capped.query({}).total).toBe(0);
+    capped.close();
+    await rm(small, { recursive: true, force: true });
+  });
+
+  it("trims a backlog bigger than the SQL variable limit", async () => {
+    const small = await mkdtemp(join(tmpdir(), "rehydra-many-"));
+    const wide = new MaskingRecordStore(
+      {
+        enabled: true,
+        includeOriginal: true,
+        keepDays: 7,
+        keepBytes: 1024 * 1024 * 1024,
+        maxRecordBytes: 4096,
+        dir: small,
+      },
+      () => undefined,
+    );
+    // 打开一次库把表建出来，之后直接用 SQL 灌数据（走 add 会被逐条裁剪拖慢）。
+    wide.query({});
+    wide.close();
+
+    // 直接灌 40000 行：一次裁剪要删的条数超过 SQLITE_MAX_VARIABLE_NUMBER（32766），
+    // 单条无界 DELETE 会报 too many SQL variables，只有分批删才不会。
+    const base = Date.now() - 400_000;
+    // vite 解析不到 node:sqlite（实验模块），与 store 内部一样用 createRequire 取。
+    const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as {
+      DatabaseSync: new (path: string) => { exec(sql: string): void; prepare(sql: string): { run(...params: unknown[]): unknown }; close(): void };
+    };
+    const raw = new DatabaseSync(join(small, "records.sqlite"));
+    raw.exec("BEGIN");
+    const insert = raw.prepare(
+      `INSERT INTO masking_records
+       (id, session_id, time, source, status, masked, blocked, integrity, types, failure, payload, bytes, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (let i = 0; i < 40_000; i += 1) {
+      insert.run(
+        `19-${i}`,
+        "s1",
+        new Date(base + i).toISOString(),
+        "context",
+        "ok",
+        1,
+        0,
+        "complete",
+        "",
+        null,
+        "{}",
+        300,
+        base + i,
+      );
+    }
+    raw.exec("COMMIT");
+    raw.close();
+
+    const cap = 1024 * 1024;
+    const narrow = new MaskingRecordStore(
+      {
+        enabled: true,
+        includeOriginal: true,
+        keepDays: 7,
+        keepBytes: cap,
+        maxRecordBytes: 4096,
+        dir: small,
+      },
+      () => undefined,
+    );
+    narrow.add(record("19-newest"));
+    expect(narrow.droppedCount).toBe(0);
+    expect(narrow.query({ limit: 200 }).records.map((row) => row.id)).toContain("19-newest");
+    expect(narrow.query({}).total).toBeLessThan(40_000);
+    expect(await diskUsage(small)).toBeLessThanOrEqual(cap);
+    narrow.close();
+    await rm(small, { recursive: true, force: true });
+  });
+
+  it("does not delete a big new record when the old small one already fits", async () => {
+    const cap = 256 * 1024;
+    const small = await mkdtemp(join(tmpdir(), "rehydra-boundary-"));
+    const capped = new MaskingRecordStore(
+      {
+        enabled: true,
+        includeOriginal: true,
+        keepDays: 7,
+        keepBytes: cap,
+        maxRecordBytes: cap,
+        dir: small,
+      },
+      () => undefined,
+    );
+    const older = new Date(Date.now() - 60_000).toISOString();
+    capped.add(
+      record("17-old", {
+        time: older,
+        snapshot: { before: "x".repeat(20_000), after: "y".repeat(20_000) },
+      }),
+    );
+    capped.add(
+      record("17-new", {
+        snapshot: { before: "x".repeat(90_000), after: "y".repeat(90_000) },
+      }),
+    );
+
+    // 只要删掉小的旧记录就能回到预算内，就不该动大的新记录。
+    expect(capped.get("17-new")).not.toBeNull();
+    capped.close();
+    await rm(small, { recursive: true, force: true });
+  });
+
+  it("keeps trimming across rounds when the cap is close to the empty-database footprint", async () => {
+    const small = await mkdtemp(join(tmpdir(), "rehydra-floor-"));
+    const wide = new MaskingRecordStore(
+      {
+        enabled: true,
+        includeOriginal: true,
+        keepDays: 7,
+        keepBytes: 64 * 1024 * 1024,
+        maxRecordBytes: 4096,
+        dir: small,
+      },
+      () => undefined,
+    );
+    for (let i = 0; i < 1000; i += 1) {
+      wide.add(record(`20-${i}`, { time: new Date(Date.now() - 100_000 + i).toISOString() }));
+    }
+    wide.close();
+
+    // 上限只比空库占用高一点：一轮删不够，必须多轮渐进才落到 cap 以下。
+    const cap = 64 * 1024;
+    const narrow = new MaskingRecordStore(
+      {
+        enabled: true,
+        includeOriginal: true,
+        keepDays: 7,
+        keepBytes: cap,
+        maxRecordBytes: 4096,
+        dir: small,
+      },
+      () => undefined,
+    );
+    narrow.add(record("20-newest"));
+    expect(narrow.get("20-newest")).not.toBeNull();
+    expect(await diskUsage(small)).toBeLessThanOrEqual(cap);
+    narrow.close();
     await rm(small, { recursive: true, force: true });
   });
 

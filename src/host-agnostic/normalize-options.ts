@@ -76,7 +76,7 @@ export const DEFAULT_RECORD_OPTIONS: Omit<RecordOptions, "dir"> = {
   enabled: true,
   includeOriginal: true,
   keepDays: 7,
-  keepBytes: 32 * 1024 * 1024,
+  keepBytes: 300 * 1024 * 1024,
   maxRecordBytes: 4 * 1024 * 1024,
 };
 
