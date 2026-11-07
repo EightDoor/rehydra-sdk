@@ -128,6 +128,15 @@ export interface MessageEndEvent {
   message: AgentMessage;
 }
 
+/** 供应商载荷构建完成、即将发送前的事件；返回值会替换该载荷。 */
+export interface BeforeProviderRequestEvent {
+  type: "before_provider_request";
+  payload: unknown;
+  provider?: string;
+  api?: string;
+  model?: string;
+}
+
 /** 事件处理器签名；返回值语义由各事件决定。 */
 export type ExtensionEventHandler<E, R = void> = (
   event: E,
@@ -170,6 +179,10 @@ export interface ExtensionAPI {
   on(
     event: "message_end",
     handler: ExtensionEventHandler<MessageEndEvent, MessageEndEventResult | undefined>,
+  ): () => void;
+  on(
+    event: "before_provider_request",
+    handler: ExtensionEventHandler<BeforeProviderRequestEvent, void>,
   ): () => void;
   registerCommand(name: string, options: RegisteredCommandOptions): void;
   /** 返回合并后的 settings.json；本扩展读取约定键 `rehydra`。 */

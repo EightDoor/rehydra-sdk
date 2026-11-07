@@ -67,7 +67,7 @@ Once enabled, you can check request by request what was intercepted and what the
 }
 ```
 
-The address is printed at startup (for example `http://127.0.0.1:53211/`) — open it directly. The page lists records, filters by session / source / type / status, pages through them, and shows one record with what the extension received next to what it handed back, plus hit details and whether that masking was reliable (ok / rules-only / failed / blocked). Clearing the current session or everything happens on the page and needs a second confirmation.
+The address is printed at startup (for example `http://127.0.0.1:53211/`) — open it directly. The record list is on the left (session / source / type / status filters, paging) and the selected record on the right, with the first record already open; content panes support wrapping, find and copy. Context and tool-result records show what the extension received next to what it handed back, plus hit details, field-level comparisons and whether that masking was reliable (ok / rules-only / failed / blocked). Clearing the current session or everything happens on the page and needs a second confirmation.
 
 Records live in `~/.pi/agent/rehydra/records/records.sqlite` (directory 0700 and database 0600 on macOS/Linux; on Windows mode bits are not enforced and protection comes from the user profile's NTFS ACLs), trimmed by both a 7-day and a 32 MiB cap, with a 4 MiB per-record snapshot cap. **Original text is stored by default, so real values are written to local disk in clear text**; turn original capture off and the page still works (only the type, detector, placeholder, length and offsets are kept):
 
@@ -80,7 +80,7 @@ Records live in `~/.pi/agent/rehydra/records/records.sqlite` (directory 0700 and
 }
 ```
 
-`dashboard.enabled: false` disables the viewer. The page has no login: cross-site reads are blocked by browser same-origin rules, but other local processes can still read the records. The page only claims to show this extension's input and output, not the bytes a provider received.
+`dashboard.enabled: false` disables the viewer. The page has no login: cross-site reads are blocked by browser same-origin rules, but other local processes can still read the records. Besides the extension's input and output, the extension records the provider-shaped request body as a separate `provider_request` record (scope `provider-payload`) using the host's `before_provider_request` hook; the page labels it as captured before sending. It only observes and never rewrites the payload, later extensions may still change the request, and it is not a packet capture. This capture follows `record.enabled` and `includeOriginal`; with original capture off no request body is written.
 
 Any recording failure (unwritable directory, symlink, SQLite unavailable) only produces a warning and never affects masking or the request; the number of records that failed to persist is shown in the page's status area.
 

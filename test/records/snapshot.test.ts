@@ -2,7 +2,7 @@
  * 快照序列化的测试：二进制剔除、共享引用与真实循环。
  */
 import { describe, it, expect } from "vitest";
-import { buildSnapshot, serializeSnapshot } from "../../src/records/snapshot.js";
+import { buildProviderPayload, buildSnapshot, serializeSnapshot } from "../../src/records/snapshot.js";
 
 describe("serializeSnapshot", () => {
   it("replaces image payloads with a marker", () => {
@@ -11,6 +11,35 @@ describe("serializeSnapshot", () => {
     ]);
     expect(snapshot).not.toContain("BASE64PAYLOAD");
     expect(snapshot).toContain("binary omitted");
+  });
+
+  it("replaces provider image payloads with a marker", () => {
+    const snapshot = serializeSnapshot({
+      messages: [
+        { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "RAWBYTES" } }] },
+        { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,RAWURL" } }] },
+      ],
+    });
+    expect(snapshot).not.toContain("RAWBYTES");
+    expect(snapshot).not.toContain("RAWURL");
+    expect(snapshot).toContain("binary omitted");
+  });
+
+  it("omits the remaining provider image shapes", () => {
+    const snapshot = serializeSnapshot({
+      input: [
+        { type: "input_image", image_url: "data:image/png;base64,RAWRESPONSES" },
+        { inlineData: { mimeType: "image/png", data: "RAWGEMINI" } },
+      ],
+    });
+    expect(snapshot).not.toContain("RAWRESPONSES");
+    expect(snapshot).not.toContain("RAWGEMINI");
+    expect(snapshot).toContain("binary omitted");
+  });
+
+  it("keeps ordinary data fields instead of over-deleting", () => {
+    const snapshot = serializeSnapshot({ data: "plain business value", type: "text" });
+    expect(snapshot).toContain("plain business value");
   });
 
   it("keeps shared references instead of treating them as cycles", () => {
@@ -54,5 +83,21 @@ describe("buildSnapshot", () => {
   it("keeps small snapshots intact", () => {
     const snapshot = buildSnapshot("before", "after", 1024);
     expect(snapshot).toEqual({ before: "before", after: "after" });
+  });
+});
+
+describe("buildProviderPayload", () => {
+  it("returns undefined without a body", () => {
+    expect(buildProviderPayload(undefined, 1024)).toBeUndefined();
+  });
+
+  it("marks truncated payloads", () => {
+    const payload = buildProviderPayload("a".repeat(500), 100);
+    expect(payload?.truncated).toBe(true);
+    expect(payload?.body).toContain("[truncated]");
+  });
+
+  it("keeps small payloads intact", () => {
+    expect(buildProviderPayload('{"model":"m"}', 1024)).toEqual({ body: '{"model":"m"}' });
   });
 });

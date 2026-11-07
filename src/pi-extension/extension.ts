@@ -20,6 +20,7 @@
  */
 import type {
   AgentMessage,
+  BeforeProviderRequestEvent,
   ContextEventResult,
   ExtensionAPI,
   ExtensionContext,
@@ -55,7 +56,11 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { MaskingRecordStore } from "../records/sqlite-store.js";
 import { finderOf, type MaskingRecord, type MaskingSnapshot } from "../records/types.js";
-import { buildSnapshot, serializeSnapshot } from "../records/snapshot.js";
+import {
+  buildProviderPayload,
+  buildSnapshot,
+  serializeSnapshot,
+} from "../records/snapshot.js";
 import { startViewer, type ViewerHandle } from "../records/viewer/server.js";
 import { buildPIISystemInstruction } from "../proxy/system-instruction.js";
 import { githubUsernameRecognizer } from "./github-username.js";
@@ -300,6 +305,38 @@ function recordRelatedEvent(
 }
 
 
+
+/**
+ * 记录供应商请求体。
+ *
+ * 只观察不改写；载荷本身是原文，关闭原文保存时连元数据也不写，避免留下空壳记录。
+ */
+function recordProviderRequest(
+  state: PiExtensionState,
+  sessionId: string,
+  body: string,
+): void {
+  const store = state.store;
+  if (!store.enabled || !store.includeOriginal) return;
+  const payload = buildProviderPayload(body, store.maxRecordBytes);
+  if (payload === undefined) return;
+  const now = Date.now();
+  store.add({
+    version: 1,
+    id: store.nextId(now),
+    sessionId,
+    scope: "provider-payload",
+    source: "provider_request",
+    time: new Date(now).toISOString(),
+    durationMs: 0,
+    masked: 0,
+    blocked: false,
+    integrity: "complete",
+    hits: [],
+    comparisons: [],
+    providerPayload: payload,
+  });
+}
 
 /** Pi 扩展运行时不暴露 logger 通道，统一走 console.warn 兜底。 */
 function createConsoleLogger(): ScrubHost["log"] {
@@ -1128,6 +1165,20 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
     },
   );
 
+  // 供应商请求体：只读采集，返回值一律 undefined，绝不替换载荷。
+  pi.on("before_provider_request", (event: BeforeProviderRequestEvent, ctx) => {
+    const state = runtime.state;
+    if (state === undefined) return;
+    const body = serializeSnapshot(event.payload);
+    if (body === undefined) {
+      // 失败原因码可能夹带原文，只记录供应商名。
+      state.log.warn("failed to serialize provider payload; body not recorded", {
+        provider: event.provider,
+      });
+      return;
+    }
+    recordProviderRequest(state, ctx.sessionManager.getSessionId(), body);
+  });
   pi.on("message_end", async (event: MessageEndEvent, ctx): Promise<MessageEndEventResult | undefined> => {
     const state = runtime.state;
     if (state === undefined) return undefined;

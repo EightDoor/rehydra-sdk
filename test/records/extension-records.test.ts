@@ -8,7 +8,11 @@ import { join } from "node:path";
 
 import { createRehydraPiExtension } from "../../src/pi-extension/extension.js";
 import { createMockPiContext } from "../pi-extension/pi-test-helpers.js";
-import type { ContextWithSystemEvent, ToolCallEvent } from "../../src/pi-extension/host-types.js";
+import type {
+  BeforeProviderRequestEvent,
+  ContextWithSystemEvent,
+  ToolCallEvent,
+} from "../../src/pi-extension/host-types.js";
 
 const EMAIL = ["alice", "@", "example.com"].join("");
 // 拼出一个无法还原的字面标签，避免源码里出现标签字面量
@@ -101,6 +105,55 @@ describe("rehydra records", () => {
     const listed = store.query({});
     expect(listed.records.some((row) => row.source === "tool_call")).toBe(true);
     expect(listed.records.some((row) => row.status === "blocked")).toBe(true);
+    store.close();
+  });
+
+  it("records the provider payload without touching it", async () => {
+    await start({ record: { enabled: true, includeOriginal: true, dir } });
+    const handler = mock.handlers.find((h) => h.name === "before_provider_request");
+    const payload = {
+      model: "test-model",
+      messages: [{ role: "user", content: `mail ${EMAIL}` }],
+    };
+    const result = await handler!.handler(
+      { type: "before_provider_request", provider: "test", payload } as BeforeProviderRequestEvent,
+      mock.ctx,
+    );
+    // 钩子必须保持载荷不变，否则会改写真正发出去的请求。
+    expect(result).toBeUndefined();
+    expect(payload.messages[0]!.content).toContain(EMAIL);
+
+    const { MaskingRecordStore } = await import("../../src/records/sqlite-store.js");
+    const store = new MaskingRecordStore(
+      { enabled: true, includeOriginal: true, keepDays: 7, keepBytes: 1 << 20, maxRecordBytes: 1 << 20, dir },
+      () => undefined,
+    );
+    const listed = store.query({ source: "provider_request" });
+    expect(listed.total).toBe(1);
+    const record = store.get(listed.records[0]!.id);
+    expect(record?.scope).toBe("provider-payload");
+    expect(record?.providerPayload?.body).toContain(EMAIL);
+    store.close();
+  });
+
+  it("skips provider payload capture when original capture is off", async () => {
+    await start({ record: { enabled: true, includeOriginal: false, dir } });
+    const handler = mock.handlers.find((h) => h.name === "before_provider_request");
+    await handler!.handler(
+      {
+        type: "before_provider_request",
+        provider: "test",
+        payload: { messages: [{ role: "user", content: `mail ${EMAIL}` }] },
+      } as BeforeProviderRequestEvent,
+      mock.ctx,
+    );
+
+    const { MaskingRecordStore } = await import("../../src/records/sqlite-store.js");
+    const store = new MaskingRecordStore(
+      { enabled: true, includeOriginal: true, keepDays: 7, keepBytes: 1 << 20, maxRecordBytes: 1 << 20, dir },
+      () => undefined,
+    );
+    expect(store.query({}).total).toBe(0);
     store.close();
   });
 

@@ -54,10 +54,15 @@ export interface MaskingRecord {
   id: string;
   /** 所属会话。 */
   sessionId: string;
-  /** 记录范围：始终为本扩展处理后的模型输入。 */
-  scope: "model-input";
+  /** 记录范围：扩展处理后的模型输入，或发送前的供应商请求体。 */
+  scope: "model-input" | "provider-payload";
   /** 来源事件。 */
-  source: "context" | "tool_call" | "tool_result" | "message_end";
+  source:
+    | "context"
+    | "tool_call"
+    | "tool_result"
+    | "message_end"
+    | "provider_request";
   /** 发生时间（ISO 8601）。 */
   time: string;
   /** 处理耗时（毫秒）。 */
@@ -76,6 +81,8 @@ export interface MaskingRecord {
   errors?: Array<{ finder: MaskingFinder; code: string }>;
   /** 完整文本快照：钩子收到的内容与扩展输出的内容。 */
   snapshot?: MaskingSnapshot;
+  /** 发送前钩子看到的供应商请求体；只在保存原文时存在。 */
+  providerPayload?: MaskingProviderPayload;
   /** 脱敏过程失败但按现有策略放行时的原因码（不含正文）。 */
   failure?: string;
 }
@@ -90,6 +97,16 @@ export interface MaskingRecord {
 export interface MaskingSnapshot {
   before: string;
   after: string;
+  truncated?: boolean;
+}
+
+/**
+ * 供应商请求体快照。
+ *
+ * 是发送前钩子看到的载荷，不是网络抓包结果：后加载的扩展仍可能改写它。
+ */
+export interface MaskingProviderPayload {
+  body: string;
   truncated?: boolean;
 }
 

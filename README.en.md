@@ -101,7 +101,9 @@ Collection fields in `policy` may be written as arrays and thresholds as plain o
 
 The Pi extension records masking results per request by default and starts a viewer that only listens on the loopback address: what the extension received next to what it handed back, with hit details and failure markers.
 
-The address is printed at startup (for example `http://127.0.0.1:53211/`) — open it directly. The page lists records, filters by session / source / type / status, pages through them, and shows one record with its details; clearing requires a second confirmation.
+The address is printed at startup (for example `http://127.0.0.1:53211/`) — open it directly. The page shows the record list on the left (session / source / type / status filters, paging) and the selected record on the right, with the first record already open; content panes support wrapping, find and copy. Clearing lives in the toolbar and requires a second confirmation.
+
+Details follow the record type: context and tool-result records show "what the extension received" next to "what it handed back", plus hit details and field-level comparisons; `provider_request` records show the provider payload captured right before sending. That payload comes from the host's `before_provider_request` hook, is only observed (never rewritten), may still be changed by later extensions, and does not prove the request reached the network or the model.
 
 Records live in `~/.pi/agent/rehydra/records/records.sqlite` (directory 0700 and database 0600 on macOS/Linux; on Windows mode bits are not enforced and protection comes from the user profile's NTFS ACLs), trimmed by 7 days and 32 MiB, with a 4 MiB per-record snapshot cap. Original text is stored by default, so **real values land on local disk in clear text**. Turn both off when you do not want that:
 

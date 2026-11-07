@@ -136,6 +136,41 @@ describe("local masking viewer", () => {
     expect(detailBody.snapshot?.before).toContain(EMAIL);
   });
 
+  it("serves provider payload records and filters them by source", async () => {
+    store.add({
+      ...record("r-payload"),
+      scope: "provider-payload",
+      source: "provider_request",
+      snapshot: undefined,
+      providerPayload: { body: '{"model":"m"}' },
+    });
+    const list = await fetch(`${base()}/api/records?source=provider_request`, {
+      headers: { "x-rehydra-viewer": "1" },
+    });
+    expect(list.status).toBe(200);
+    const listed = (await list.json()) as { records: Array<{ id: string }>; total: number };
+    expect(listed.total).toBe(1);
+    expect(listed.records[0]?.id).toBe("r-payload");
+
+    const detail = await fetch(`${base()}/api/records/r-payload`, {
+      headers: { "x-rehydra-viewer": "1" },
+    });
+    expect(detail.status).toBe(200);
+    const body = (await detail.json()) as { providerPayload?: { body: string } };
+    expect(body.providerPayload?.body).toContain("m");
+  });
+
+  it("renders the workbench layout with detail tools", async () => {
+    const response = await fetch(base());
+    const body = await response.text();
+    // 详情工具随记录动态生成，静态页面只需带上脚本与容器。
+    expect(body).toContain("findBox");
+    expect(body).toContain("copyButton");
+    expect(body).toContain('class="panel detail"');
+    expect(body).toContain('id="list-empty"');
+    expect(body).toContain('value="provider_request"');
+  });
+
   it("returns 404 for an unknown record", async () => {
     const response = await fetch(`${base()}/api/records/nope`, {
       headers: { "x-rehydra-viewer": "1" },

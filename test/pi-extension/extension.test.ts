@@ -41,6 +41,7 @@ describe("Rehydra Pi extension", () => {
     const names = mock.handlers.map((h) => h.name).sort();
     expect(names).toEqual(
       [
+        "before_provider_request",
         "context_with_system",
         "message_end",
         "session_shutdown",
