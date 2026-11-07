@@ -52,6 +52,7 @@ import {
   policyFromOptions,
 } from "../host-agnostic/normalize-options.js";
 import { buildTagPrefix } from "../utils/regex.js";
+import { extractTags } from "../pipeline/tagger.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { MaskingRecordStore } from "../records/sqlite-store.js";
@@ -338,13 +339,14 @@ function recordProviderRequest(
   });
 }
 
-/** Pi 扩展运行时不暴露 logger 通道，统一走 console.warn 兜底。 */
+/**
+ * Pi 扩展运行时不暴露 logger 通道，统一走 console.warn 兜底。
+ *
+ * 只有 warn / error 落终端：info / debug 是每轮请求都会写的流水日志，直接打进
+ * 终端会把用户正在编辑的输入区刷乱。
+ */
 function createConsoleLogger(): ScrubHost["log"] {
-  const emit = (
-    level: "debug" | "info" | "warn" | "error",
-    message: string,
-    extra?: Record<string, unknown>,
-  ): void => {
+  const emit = (level: "warn" | "error", message: string, extra?: Record<string, unknown>): void => {
     const suffix = extra === undefined ? "" : ` extra=${JSON.stringify(extra)}`;
     const line = `service=pi-rehydra level=${level} message=${message}${suffix}`;
     if (level === "error") {
@@ -356,8 +358,8 @@ function createConsoleLogger(): ScrubHost["log"] {
     }
   };
   return {
-    debug: (message, extra) => emit("debug", message, extra),
-    info: (message, extra) => emit("info", message, extra),
+    debug: () => undefined,
+    info: () => undefined,
     warn: (message, extra) => emit("warn", message, extra),
     error: (message, extra) => emit("error", message, extra),
   };
@@ -1193,8 +1195,19 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
       }
       const obj = block as Record<string, unknown>;
       if (obj.type === "text" && typeof obj.text === "string") {
-        const restored = await session.rehydrate(obj.text);
-        newContent.push({ ...obj, text: restored });
+        // 只有正文里确实有标签才需要还原：会话没有任何 PII 映射时，
+        // rehydrate() 会因缺少映射抛错，把整条消息的替换都废掉。
+        if (extractTags(obj.text, state.tagFormat).length === 0) {
+          newContent.push(block);
+          continue;
+        }
+        try {
+          const restored = await session.rehydrate(obj.text);
+          newContent.push({ ...obj, text: restored });
+        } catch {
+          // 还原失败时保留原样（正文仍是标签），不让单个块废掉整条消息。
+          newContent.push(block);
+        }
       } else if (obj.type === "thinking" && typeof obj.thinking === "string") {
         // 思考块是面向模型的；按原 plugin 的行为保留 PII 标签，避免泄漏。
         newContent.push(block);

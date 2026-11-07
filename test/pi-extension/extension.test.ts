@@ -6,7 +6,7 @@
  * - 运行阶段：scrub / rehydrate 在 Pi 事件中正确工作；
  * - 资源阶段：session_shutdown 幂等释放匿名器。
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createRehydraPiExtension } from "../../src/pi-extension/extension.js";
 import {
@@ -400,5 +400,119 @@ describe("Rehydra Pi extension", () => {
       {},
       localMock.ctx,
     );
+  });
+  /**
+   * 回填两路之一：助手最终回复。模型看到的标签必须在落盘/显示前换回原文，
+   * 且非文本块（思考、工具调用）保持模型侧形态。
+   */
+  it("restores the exact original text in assistant replies on message_end", async () => {
+    const original = `run ${TEST_SECRET}/v3, then ${TEST_SECRET}/v3 again`;
+    const modelFacing = await scrubUserMessage(original);
+    expect(modelFacing).not.toContain(TEST_SECRET);
+
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "text", text: `Before ${modelFacing} after` },
+        { type: "thinking", thinking: `thinking ${modelFacing}` },
+        { type: "toolCall", id: "call-m", name: "bash", arguments: { command: modelFacing } },
+        { type: "text", text: "no tags here" },
+      ],
+      timestamp: 42,
+    } as never;
+
+    const result = (await eventHandler(mock, "message_end")(
+      { type: "message_end", message },
+      mock.ctx,
+    )) as {
+      message: { role: string; timestamp: number; content: Record<string, unknown>[] };
+    };
+
+    expect(result.message.role).toBe("assistant");
+    expect(result.message.timestamp).toBe(42);
+    expect(result.message.content.map((block) => block["type"])).toEqual([
+      "text",
+      "thinking",
+      "toolCall",
+      "text",
+    ]);
+    // 逐字相等：不是"标签消失"，而是回到用户原文。
+    expect(result.message.content[0]?.["text"]).toBe(`Before ${original} after`);
+    expect(result.message.content[1]?.["thinking"]).toBe(`thinking ${modelFacing}`);
+    expect(result.message.content[3]?.["text"]).toBe("no tags here");
+  });
+
+  it("ignores messages that are not assistant text blocks on message_end", async () => {
+    const handler = eventHandler(mock, "message_end");
+    const user = { role: "user", content: "hi", timestamp: 0 } as never;
+    await expect(handler({ type: "message_end", message: user }, mock.ctx)).resolves.toBeUndefined();
+
+    const plain = { role: "assistant", content: "plain string", timestamp: 0 } as never;
+    await expect(
+      handler({ type: "message_end", message: plain }, mock.ctx),
+    ).resolves.toBeUndefined();
+  });
+
+  /**
+   * 回归：会话还没有任何 PII 映射时，rehydrate() 会抛 "No PII map found"，
+   * 抛出会让整条助手消息的替换被跳过（Pi 记为扩展错误）。
+   */
+  it("keeps assistant replies intact when the session has no PII map", async () => {
+    const startHandler = mock.handlers.find((h) => h.name === "session_start")!;
+    await startHandler.handler({}, mock.ctx);
+
+    const result = (await eventHandler(mock, "message_end")(
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "plain reply" }],
+          timestamp: 0,
+        } as never,
+      },
+      mock.ctx,
+    )) as { message: { content: { type: string; text: string }[] } };
+
+    expect(result.message.content[0]?.text).toBe("plain reply");
+  });
+
+  /**
+   * 流水日志（info/debug）不能写终端：每轮请求都会打，会把用户正在编辑的输入区刷乱。
+   * warn / error 仍然保留，用于可诊断的异常路径。
+   */
+  it("keeps info and debug logs off the terminal", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const modelFacing = await scrubUserMessage(`use ${TEST_SECRET} now`);
+      const toolEvent = {
+        type: "tool_call",
+        toolCallId: "call-quiet",
+        toolName: "bash",
+        input: { command: `echo ${modelFacing}` },
+      } as ToolCallEvent;
+      await eventHandler(mock, "tool_call")(toolEvent, mock.ctx);
+      await eventHandler(mock, "message_end")(
+        {
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: modelFacing }],
+            timestamp: 0,
+          } as never,
+        },
+        mock.ctx,
+      );
+    } finally {
+      log.mockRestore();
+      warn.mockRestore();
+      error.mockRestore();
+    }
+
+
+    expect(log).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
   });
 });
