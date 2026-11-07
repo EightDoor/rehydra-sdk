@@ -1,5 +1,5 @@
 /**
- * 扩展层记录与 `/rehydra` 子命令的集成测试。
+ * 扩展层记录与本机查看页面的集成测试。
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -35,13 +35,6 @@ describe("rehydra records", () => {
     await startHandler!.handler({}, mock.ctx);
   }
 
-  async function runCommand(args: string): Promise<string> {
-    const command = mock.commandHandlers.get("rehydra");
-    expect(command).toBeDefined();
-    await command!(args, mock.ctx);
-    return mock.notifications.join("\n");
-  }
-
   async function scrubContext(text: string): Promise<void> {
     const handler = mock.handlers.find((h) => h.name === "context_with_system");
     const event: ContextWithSystemEvent = {
@@ -50,34 +43,41 @@ describe("rehydra records", () => {
     await handler!.handler(event, mock.ctx);
   }
 
-  it("records hits and comparisons for a context request", async () => {
+  it("stores hits and the full before/after snapshot", async () => {
     await start({ record: { enabled: true, includeOriginal: true, dir } });
     await scrubContext(`mail ${EMAIL} now`);
 
-    const output = await runCommand("log");
-    expect(output).toContain("context");
-    expect(output).toContain("EMAIL");
+    const { MaskingRecordStore } = await import("../../src/records/sqlite-store.js");
+    const store = new MaskingRecordStore(
+      { enabled: true, includeOriginal: true, keepDays: 7, keepBytes: 1 << 20, maxRecordBytes: 1 << 20, dir },
+      () => undefined,
+    );
+    const listed = store.query({});
+    expect(listed.total).toBeGreaterThan(0);
+
+    const record = store.get(listed.records[0]!.id);
+    expect(record?.hits.some((hit) => hit.type === "EMAIL")).toBe(true);
+    // 快照保存钩子收到的内容与扩展输出的内容：未命中字段也在。
+    expect(record?.snapshot?.before).toContain(EMAIL);
+    expect(record?.snapshot?.after).not.toContain(EMAIL);
+    expect(record?.snapshot?.after).toContain("now");
+    store.close();
   });
 
-  it("shows before/after for a record detail", async () => {
-    await start({ record: { enabled: true, includeOriginal: true, dir } });
-    await scrubContext(`mail ${EMAIL} now`);
-
-    const id = /#(\d+-\d+)/.exec(await runCommand("log"))?.[1];
-    expect(id).toBeDefined();
-
-    const detail = await runCommand(`log ${id}`);
-    expect(detail).toContain("before:");
-    expect(detail).toContain("after");
-  });
-
-  it("omits original text when includeOriginal is off", async () => {
+  it("omits the snapshot when original capture is off", async () => {
     await start({ record: { enabled: true, includeOriginal: false, dir } });
     await scrubContext(`mail ${EMAIL} now`);
 
-    const id = /#(\d+-\d+)/.exec(await runCommand("log"))?.[1];
-    const detail = await runCommand(`log ${id}`);
-    expect(detail).toContain("original text not stored");
+    const { MaskingRecordStore } = await import("../../src/records/sqlite-store.js");
+    const store = new MaskingRecordStore(
+      { enabled: true, includeOriginal: false, keepDays: 7, keepBytes: 1 << 20, maxRecordBytes: 1 << 20, dir },
+      () => undefined,
+    );
+    const listed = store.query({});
+    const record = store.get(listed.records[0]!.id);
+    expect(record?.snapshot).toBeUndefined();
+    expect(record?.hits.length).toBeGreaterThan(0);
+    store.close();
   });
 
   it("records a blocked tool call as a related event", async () => {
@@ -93,39 +93,123 @@ describe("rehydra records", () => {
       mock.ctx,
     );
 
-    expect(await runCommand("log")).toContain("tool_call");
+    const { MaskingRecordStore } = await import("../../src/records/sqlite-store.js");
+    const store = new MaskingRecordStore(
+      { enabled: true, includeOriginal: true, keepDays: 7, keepBytes: 1 << 20, maxRecordBytes: 1 << 20, dir },
+      () => undefined,
+    );
+    const listed = store.query({});
+    expect(listed.records.some((row) => row.source === "tool_call")).toBe(true);
+    expect(listed.records.some((row) => row.status === "blocked")).toBe(true);
+    store.close();
   });
 
-  it("reports nothing when recording is off", async () => {
+  it("writes nothing when recording is off", async () => {
     await start({ record: { enabled: false, dir } });
-    expect(await runCommand("log")).toContain("Recording is off");
-  });
-
-  it("requires confirmation before clearing", async () => {
-    await start({ record: { enabled: true, dir }, confirmAnswer: false });
     await scrubContext(`mail ${EMAIL} now`);
 
-    expect(await runCommand("clear")).toContain("Cancelled");
-    expect(mock.confirmations.length).toBe(1);
+    const { MaskingRecordStore } = await import("../../src/records/sqlite-store.js");
+    const store = new MaskingRecordStore(
+      { enabled: true, includeOriginal: true, keepDays: 7, keepBytes: 1 << 20, maxRecordBytes: 1 << 20, dir },
+      () => undefined,
+    );
+    expect(store.query({}).total).toBe(0);
+    store.close();
   });
 
-  it("clears records when confirmed", async () => {
-    await start({ record: { enabled: true, dir }, confirmAnswer: true });
-    await scrubContext(`mail ${EMAIL} now`);
+  it("records the actual content when masking fails and the request passes through", async () => {
+    const { vi } = await import("vitest");
+    const { AnonymizerSessionImpl } = await import("../../src/storage/session.js");
+    vi.spyOn(AnonymizerSessionImpl.prototype, "anonymize").mockRejectedValue(
+      new Error("storage unavailable"),
+    );
+    try {
+      await start({ record: { enabled: true, includeOriginal: true, dir } });
+      await scrubContext(`mail ${EMAIL} now`);
 
-    await runCommand("clear --all");
-    expect(await runCommand("log")).toContain("No masking records");
+      const { MaskingRecordStore } = await import("../../src/records/sqlite-store.js");
+      const store = new MaskingRecordStore(
+        {
+          enabled: true,
+          includeOriginal: true,
+          keepDays: 7,
+          keepBytes: 1 << 20,
+          maxRecordBytes: 1 << 20,
+          dir,
+        },
+        () => undefined,
+      );
+      const listed = store.query({});
+      const record = store.get(listed.records[0]!.id);
+      // 失败也要留下记录，并且明确标出这次请求没有被脱敏。
+      expect(record?.failure).toContain("masking-failed");
+      expect(record?.snapshot?.before).toContain(EMAIL);
+      expect(listed.records[0]?.status).toBe("failed");
+      store.close();
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 
-  it("keeps the plain status output", async () => {
-    await start({});
-    const output = await runCommand("");
-    expect(output).toContain("Rehydra Pi extension active.");
-    expect(output).toContain("regexTypes:");
+  it("stores only a failure code when masking fails with a message carrying content", async () => {
+    const { vi } = await import("vitest");
+    const { AnonymizerSessionImpl } = await import("../../src/storage/session.js");
+    // 异常 message 里夹带原文：关闭原文保存时，这句话不能出现在记录里。
+    const leaked = ["secret", "payload", "in-message"].join("-");
+    vi.spyOn(AnonymizerSessionImpl.prototype, "anonymize").mockRejectedValue(
+      new Error(`upstream rejected ${leaked}`),
+    );
+    try {
+      await start({ record: { enabled: true, includeOriginal: false, dir } });
+      await scrubContext(`mail ${EMAIL} now`);
+
+      const { MaskingRecordStore } = await import("../../src/records/sqlite-store.js");
+      const store = new MaskingRecordStore(
+        {
+          enabled: true,
+          includeOriginal: true,
+          keepDays: 7,
+          keepBytes: 1 << 20,
+          maxRecordBytes: 1 << 20,
+          dir,
+        },
+        () => undefined,
+      );
+      const listed = store.query({});
+      const record = store.get(listed.records[0]!.id);
+      expect(record?.failure).toBe("masking-failed");
+      expect(JSON.stringify(record)).not.toContain(leaked);
+      expect(listed.records[0]?.failure).toBe("masking-failed");
+      store.close();
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 
-  it("prints usage for an unknown subcommand", async () => {
-    await start({});
-    expect(await runCommand("nope")).toContain("Usage:");
+  it("keeps the tool result original text next to the masked output", async () => {
+    await start({ record: { enabled: true, includeOriginal: true, dir } });
+    const toolResult = mock.handlers.find((h) => h.name === "tool_result");
+    await toolResult!.handler(
+      {
+        type: "tool_result",
+        toolCallId: "c2",
+        toolName: "bash",
+        input: {},
+        content: [{ type: "text", text: `value=${EMAIL}` }],
+        isError: false,
+      },
+      mock.ctx,
+    );
+
+    const { MaskingRecordStore } = await import("../../src/records/sqlite-store.js");
+    const store = new MaskingRecordStore(
+      { enabled: true, includeOriginal: true, keepDays: 7, keepBytes: 1 << 20, maxRecordBytes: 1 << 20, dir },
+      () => undefined,
+    );
+    const listed = store.query({ source: "tool_result" });
+    const record = store.get(listed.records[0]!.id);
+    expect(record?.snapshot?.before).toContain(EMAIL);
+    expect(record?.snapshot?.after).not.toContain(EMAIL);
+    store.close();
   });
 });

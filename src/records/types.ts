@@ -74,6 +74,23 @@ export interface MaskingRecord {
   relatedEvents?: MaskingRelatedEvent[];
   /** 记录层错误，如模型不可用。 */
   errors?: Array<{ finder: MaskingFinder; code: string }>;
+  /** 完整文本快照：钩子收到的内容与扩展输出的内容。 */
+  snapshot?: MaskingSnapshot;
+  /** 脱敏过程失败但按现有策略放行时的原因码（不含正文）。 */
+  failure?: string;
+}
+
+/**
+ * 完整文本快照。
+ *
+ * `before` 是钩子实际收到的内容，`after` 是扩展实际交给宿主的内容；两者都是
+ * JSON 文本，保留消息角色、块顺序与工具参数结构。超出单条预算时各自截断并
+ * 标记，不伪称完整。
+ */
+export interface MaskingSnapshot {
+  before: string;
+  after: string;
+  truncated?: boolean;
 }
 
 /** 已知值检测器的标识前缀。 */

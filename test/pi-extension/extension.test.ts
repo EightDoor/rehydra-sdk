@@ -354,24 +354,50 @@ describe("Rehydra Pi extension", () => {
     expect(bashResult?.reason).toContain("missing-pii-map");
   });
 
-  it("registers the rehydra command", () => {
-    expect(mock.commands).toContain("rehydra");
+  it("does not register a slash command", () => {
+    // 记录查看统一由本机网页提供，不再有命令行入口。
+    expect(mock.commands).toEqual([]);
   });
 
-  it("lists the effective regex types in the status output", async () => {
-    const startHandler = mock.handlers.find((h) => h.name === "session_start");
-    expect(startHandler).toBeDefined();
-    await startHandler!.handler({}, mock.ctx);
+  it("releases the previous viewer when session_start fires again", async () => {
+    const localMock = createMockPiContext({ dashboard: { enabled: true } });
+    createRehydraPiExtension(localMock.api);
+    const start = localMock.handlers.find((h) => h.name === "session_start")!;
 
-    const command = mock.commandHandlers.get("rehydra");
-    expect(command).toBeDefined();
-    await command!("", mock.ctx);
+    await start.handler({}, localMock.ctx);
+    const first = localMock.notifications[0] ?? "";
+    await start.handler({}, localMock.ctx);
+    const second = localMock.notifications[1] ?? "";
 
-    const output = mock.notifications.join("\n");
-    expect(output).toContain("regexTypes:");
-    // 形状级类型默认关闭
-    expect(output).not.toContain("BIC_SWIFT");
-    expect(output).not.toContain("POSTAL_CODE");
-    expect(output).not.toContain("DATE,");
+    const firstUrl = /http:\/\/127\.0\.0\.1:\d+\//.exec(first)?.[0];
+    const secondUrl = /http:\/\/127\.0\.0\.1:\d+\//.exec(second)?.[0];
+    expect(firstUrl).toBeDefined();
+    expect(secondUrl).toBeDefined();
+    // 旧页面必须已经关闭：同一个地址不再响应。
+    const stale = await fetch(firstUrl!).catch(() => undefined);
+    expect(stale).toBeUndefined();
+    // 新地址照常可用。
+    const fresh = await fetch(secondUrl!);
+    expect(fresh.status).toBe(200);
+
+    await localMock.handlers.find((h) => h.name === "session_shutdown")!.handler(
+      {},
+      localMock.ctx,
+    );
+  });
+
+  it("starts the local viewer and reports its address", async () => {
+    const localMock = createMockPiContext({ dashboard: { enabled: true } });
+    createRehydraPiExtension(localMock.api);
+    await localMock.handlers.find((h) => h.name === "session_start")!.handler(
+      {},
+      localMock.ctx,
+    );
+    const output = localMock.notifications.join("\n");
+    expect(output).toContain("http://127.0.0.1:");
+    await localMock.handlers.find((h) => h.name === "session_shutdown")!.handler(
+      {},
+      localMock.ctx,
+    );
   });
 });

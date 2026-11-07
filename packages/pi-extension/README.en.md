@@ -41,18 +41,18 @@ Every key under `rehydra` is an extension option: `envFiles`, `redactValues`, `m
 
 | Event | Effect |
 |---|---|
-| `session_start` | Instantiate the anonymizer, build the session map, parse the `rehydra` config |
+| `session_start` | Instantiate the anonymizer, build the session map, parse the `rehydra` config, start the local viewer |
 | `context_with_system` | Anonymize all request messages and inject the rehydra instruction when needed |
 | `tool_call` | Strictly restore PII tags in tool arguments before local execution; an unresolvable tag blocks the call |
 | `tool_result` | Anonymize the completed tool result before it re-enters model context |
 | `message_end` | Rewrite the final assistant message so PII tags are replaced with real values |
-| `session_shutdown` | Dispose of the anonymizer and session registry |
+| `session_shutdown` | Close the viewer, dispose of the anonymizer and session registry |
 
 Masked message roles: `user`, `assistant`, `toolResult`, `system` (its `content` and prompt sections, except the tool declarations section), `bashExecution` (command and output), `custom`, `branchSummary`, and `compactionSummary` — exactly the roles Pi turns into model input. When the current request replaced anything, the placeholder guidance is injected as its own prompt section, so the model treats placeholders as opaque pass-through values.
 
 On failure: an uninitialized extension blocks tool execution. A single masking failure does not abort the request — Pi swallows handler errors and sends the unmasked content anyway, so the extension catches them and logs a warning carrying only the event name and reason, never the content.
 
-## Masking records and comparison
+## Masking records and the local viewer
 
 Once enabled, you can check request by request what was intercepted and what the model actually received:
 
@@ -67,11 +67,22 @@ Once enabled, you can check request by request what was intercepted and what the
 }
 ```
 
-`/rehydra log` lists the last 20 records for the current session, `/rehydra log <id>` shows one record (hit lines plus field-level before/after), `/rehydra log --type EMAIL` filters by type; `/rehydra clear` clears the current session and `/rehydra clear --all` clears everything (both ask for confirmation).
+The address is printed at startup (for example `http://127.0.0.1:53211/`) — open it directly. The page lists records, filters by session / source / type / status, pages through them, and shows one record with what the extension received next to what it handed back, plus hit details and whether that masking was reliable (ok / rules-only / failed / blocked). Clearing the current session or everything happens on the page and needs a second confirmation.
 
-Recording is off by default. When enabled it writes to `~/.pi/agent/rehydra/records/` (directory 0700, files 0600), trimmed by both a 7-day and a 32 MiB cap, with 256 KiB per record for comparisons. **With `includeOriginal` set to true, real values are written to local disk**; set it to false to keep only the type, detector, placeholder, length and offsets. Terminal control characters are escaped when displayed, and record text is never fed back into model context.
+Records live in `~/.pi/agent/rehydra/records/records.sqlite` (directory 0700 and database 0600 on macOS/Linux; on Windows mode bits are not enforced and protection comes from the user profile's NTFS ACLs), trimmed by both a 7-day and a 32 MiB cap, with a 4 MiB per-record snapshot cap. **Original text is stored by default, so real values are written to local disk in clear text**; turn original capture off and the page still works (only the type, detector, placeholder, length and offsets are kept):
 
-Any recording failure (unwritable directory, symlink, half-written line) only produces a warning and never affects masking or the request.
+```json
+{
+  "rehydra": {
+    "record": { "includeOriginal": false },
+    "dashboard": { "enabled": false }
+  }
+}
+```
+
+`dashboard.enabled: false` disables the viewer. The page has no login: cross-site reads are blocked by browser same-origin rules, but other local processes can still read the records. The page only claims to show this extension's input and output, not the bytes a provider received.
+
+Any recording failure (unwritable directory, symlink, SQLite unavailable) only produces a warning and never affects masking or the request; the number of records that failed to persist is shown in the page's status area.
 
 ## Limitations
 - Tool-argument rehydration is strict: when a tag is absent from this session's map (or the map is missing, or decryption fails), the tool call is blocked rather than run with `<PII .../>` as a real value. A placeholder can only be restored from the same session's map; the default map is in memory, so tags from before a process restart cannot be restored.
@@ -82,6 +93,9 @@ Any recording failure (unwritable directory, symlink, half-written line) only pr
 - Only the values of sensitive fields in an `.env` file enter the global known-value set; project names and ports are not replaced later in the text. Explicitly configured `redactValues` are not affected by that filter.
 - Collection fields in `policy` may be arrays and thresholds plain objects; an invalid field type fails startup with the field name instead of silently dropping the protection rule.
 - This extension cannot guarantee that title or compaction summaries stay sanitized — disable title agents if you need titles to be human-readable.
+
+- The viewer has no login: cross-site reads are blocked by browser same-origin rules, but other local processes can read the record database directly. With original capture on, real values stay on local disk in clear text.
+- Disk usage is capped by actual file size: trimming is followed by `VACUUM` to reclaim pages. When several processes open the same record database, `VACUUM` and WAL checkpoints can fail on file locking (more likely on Windows); such failures only log a warning, never affect masking, and reclamation is retried on the next write.
 
 ## License
 

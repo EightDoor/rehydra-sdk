@@ -46,14 +46,17 @@ import { InMemoryKeyProvider } from "../crypto/index.js";
 import { InMemoryPIIStorageProvider } from "../storage/in-memory.js";
 import {
   anonymizerConfigFromOptions,
+  DEFAULT_RECORD_OPTIONS,
   normalizeRehydraOptions,
   policyFromOptions,
 } from "../host-agnostic/normalize-options.js";
 import { buildTagPrefix } from "../utils/regex.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { MaskingRecorder } from "../records/recorder.js";
-import { detectorLabel, finderOf, type MaskingRecord } from "../records/types.js";
+import { MaskingRecordStore } from "../records/sqlite-store.js";
+import { finderOf, type MaskingRecord, type MaskingSnapshot } from "../records/types.js";
+import { buildSnapshot, serializeSnapshot } from "../records/snapshot.js";
+import { startViewer, type ViewerHandle } from "../records/viewer/server.js";
 import { buildPIISystemInstruction } from "../proxy/system-instruction.js";
 import { githubUsernameRecognizer } from "./github-username.js";
 import { gitIdentityRecognizer } from "./git-identity.js";
@@ -84,16 +87,20 @@ interface PiExtensionState {
   vcsIdentities: boolean;
   /** 当前生效的正则识别类型。 */
   effectiveRegexTypes: string[];
-  /** 脱敏记录器；未启用时 enabled 为 false。 */
-  recorder: MaskingRecorder;
+  /** 脱敏记录存储（SQLite）。 */
+  store: MaskingRecordStore;
   /** 模型检测不可用时的处理。 */
   nerFailure: "rules" | "block";
+  /** 是否启用模型检测。 */
+  nerEnabled: boolean;
   /** 上次模型降级告警时间，用于限频。 */
   lastModelWarningAt: number;
   /** 统一日志出口。 */
   log: ScrubHost["log"];
   /** 允许字面标签放行的工具名（见 `allowLiteralTagsIn`）。 */
   allowLiteralTagsIn: Set<string>;
+  /** 是否启动本机查看页面。 */
+  dashboardEnabled: boolean;
   resolveSession: (sessionId: string) => AnonymizerSessionImpl;
 }
 
@@ -184,6 +191,18 @@ const SYSTEM_TOOLS_SECTION = "tools";
 /** 注入占位符说明用的提示分段名。 */
 const REHYDRA_SECTION = "rehydra";
 
+/**
+ * 把脱敏异常折算成稳定的原因码。
+ *
+ * 异常 message 可能夹带原文（例如宿主用 `AbortSignal.abort(new Error(用户内容))`），
+ * 所以记录里只存码；排查细节仍由同一条告警日志承载。
+ */
+function maskingFailureCode(error: unknown): string {
+  if (error instanceof Error && error.name === "AbortError") return "masking-aborted";
+  if (error instanceof Error && error.name === "TimeoutError") return "masking-timeout";
+  return "masking-failed";
+}
+
 /** 降级告警按服务地址每分钟至多一条（记录在 state 上）。 */
 function warnDegradedOnce(state: PiExtensionState, errors: Array<{ code: string }>): void {
   const now = Date.now();
@@ -207,14 +226,18 @@ function recordRequest(
     truncated?: boolean;
     integrity?: "complete" | "rules-only";
     detectionErrors?: Array<{ finder: "model"; code: string }>;
+    /** 完整文本快照（钩子收到的内容与扩展输出的内容）。 */
+    snapshot?: MaskingSnapshot;
+    /** 脱敏失败但按现有策略放行时的原因码。 */
+    failure?: string;
   },
 ): void {
-  const recorder = state.recorder;
-  if (!recorder.enabled) return;
+  const store = state.store;
+  if (!store.enabled) return;
   const now = Date.now();
   const record: MaskingRecord = {
     version: 1,
-    id: recorder.nextId(now),
+    id: store.nextId(now),
     sessionId,
     scope: "model-input",
     source,
@@ -234,6 +257,8 @@ function recordRequest(
       ...(hit.original === undefined ? {} : { original: hit.original }),
     })),
     comparisons: stats.comparisons ?? [],
+    ...(stats.snapshot === undefined ? {} : { snapshot: stats.snapshot }),
+    ...(stats.failure === undefined ? {} : { failure: stats.failure }),
   };
   if (stats.truncated === true) {
     record.comparisons = record.comparisons.map((item) => ({ ...item, truncated: true }));
@@ -244,7 +269,7 @@ function recordRequest(
       code: entry.code,
     }));
   }
-  recorder.add(record);
+  store.add(record);
 }
 
 /** 记录一条关联事件（不是独立模型请求，不计命中）。 */
@@ -254,12 +279,12 @@ function recordRelatedEvent(
   kind: "tool_call" | "message_end",
   code?: string,
 ): void {
-  const recorder = state.recorder;
-  if (!recorder.enabled) return;
+  const store = state.store;
+  if (!store.enabled) return;
   const now = Date.now();
-  recorder.add({
+  store.add({
     version: 1,
-    id: recorder.nextId(now),
+    id: store.nextId(now),
     sessionId,
     scope: "model-input",
     source: kind,
@@ -275,127 +300,6 @@ function recordRelatedEvent(
 }
 
 
-/** `/rehydra` 子命令：无参数看状态，`log` 看记录，`clear` 清记录。 */
-async function handleRehydraCommand(
-  args: string,
-  state: PiExtensionState,
-  ctx: ExtensionContext,
-): Promise<void> {
-  const tokens = args.trim().split(/\s+/).filter((token) => token !== "");
-  const sub = tokens[0];
-
-  if (sub === undefined) {
-    ctx.ui.notify(
-      [
-        `Rehydra Pi extension active.`,
-        `cwd: ${ctx.sessionManager.getCwd()}`,
-        `tagPrefix: ${state.tagPrefix}`,
-        `vcsIdentities: ${state.vcsIdentities}`,
-        `regexTypes: ${state.effectiveRegexTypes.join(", ")}`,
-        `records: ${state.recorder.enabled ? "on" : "off (rehydra.record.enabled)"}`,
-      ].join("\n"),
-      "info",
-    );
-    return;
-  }
-
-  if (sub === "log") {
-    const sessionId = ctx.sessionManager.getSessionId();
-    const typeFilter = tokens.includes("--type")
-      ? tokens[tokens.indexOf("--type") + 1]
-      : undefined;
-    const target = tokens.slice(1).find((token) => !token.startsWith("--") && token !== typeFilter);
-
-    if (target !== undefined) {
-      const found = await state.recorder.find(target);
-      if (found.kind === "missing") {
-        ctx.ui.notify(`No record matches "${target}".`, "warning");
-        return;
-      }
-      if (found.kind === "ambiguous") {
-        ctx.ui.notify(`Ambiguous record id "${target}". Candidates:\n${found.ids.join("\n")}`, "warning");
-        return;
-      }
-      ctx.ui.notify(formatRecordDetail(found.record), "info");
-      return;
-    }
-
-    const records = state.recorder
-      .recent(20, sessionId)
-      .filter(
-        (record) =>
-          typeFilter === undefined ||
-          record.hits.some((hit) => String(hit.type) === typeFilter),
-      );
-    if (records.length === 0) {
-      ctx.ui.notify(
-        state.recorder.enabled
-          ? "No masking records for this session yet."
-          : "Recording is off. Set rehydra.record.enabled to true.",
-        "info",
-      );
-      return;
-    }
-    ctx.ui.notify(records.map(formatRecordSummary).join("\n"), "info");
-    return;
-  }
-
-  if (sub === "clear") {
-    const all = tokens.includes("--all");
-    const scope = all ? "all sessions" : "this session";
-    const confirmed = await ctx.ui.confirm?.(`Delete masking records for ${scope}?`);
-    if (confirmed !== true) {
-      ctx.ui.notify("Cancelled; records were not deleted.", "info");
-      return;
-    }
-    await state.recorder.clear(all ? "all" : "session", ctx.sessionManager.getSessionId());
-    ctx.ui.notify(`Masking records cleared for ${scope}.`, "info");
-    return;
-  }
-
-  ctx.ui.notify("Usage: /rehydra [log [<id>] [--type TYPE] | clear [--all]]", "warning");
-}
-
-/** 记录摘要行。 */
-function formatRecordSummary(record: MaskingRecord): string {
-  const kinds = record.hits.map((hit) => hit.type).join(",");
-  return `#${record.id} ${record.time} ${record.source} masked=${record.masked} ${record.durationMs}ms${kinds === "" ? "" : ` (${kinds})`}`;
-}
-
-/** 单条记录详情：命中行 + 字段级前后对照。 */
-function formatRecordDetail(record: MaskingRecord): string {
-  const lines = [
-    `#${record.id} ${record.time} ${record.source} masked=${record.masked} ${record.durationMs}ms`,
-    `session: ${record.sessionId}  scope: ${record.scope}  integrity: ${record.integrity}`,
-  ];
-  if (record.relatedEvents !== undefined) {
-    for (const event of record.relatedEvents) {
-      lines.push(`related: ${event.kind}${event.code === undefined ? "" : ` (${event.code})`}`);
-    }
-  }
-  for (const hit of record.hits) {
-    const head = hit.original === undefined ? `${hit.length}c` : `${JSON.stringify(hit.original)}`;
-    lines.push(
-      `  - ${hit.type} [${hit.finder}] ${detectorLabel(hit.detector)} ${hit.placeholder} ${head}`,
-    );
-  }
-  for (const item of record.comparisons) {
-    if (item.before === "" && item.after === "") {
-      lines.push(`  ~ ${item.path} (original text not stored)`);
-      continue;
-    }
-    lines.push(`  ~ ${item.path}`);
-    lines.push(`      before: ${escapeForTerminal(item.before)}`);
-    lines.push(`      after : ${escapeForTerminal(item.after)}`);
-  }
-  return lines.join("\n");
-}
-
-/** 转义终端控制字符，避免记录里的原文改写终端。 */
-function escapeForTerminal(text: string): string {
-  // eslint-disable-next-line no-control-regex
-  return text.replace(/[\u0000-\u001f\u007f]/g, (char) => `\\x${char.charCodeAt(0).toString(16).padStart(2, "0")}`);
-}
 
 /** Pi 扩展运行时不暴露 logger 通道，统一走 console.warn 兜底。 */
 function createConsoleLogger(): ScrubHost["log"] {
@@ -797,6 +701,46 @@ export interface RehydraPiHandle {
 }
 
 /**
+ * 启动本机查看页面并展示访问地址。
+ *
+ * 只监听 127.0.0.1 的随机端口；页面失败不影响脱敏主流程，只留一条告警。
+ */
+async function startViewerService(
+  state: PiExtensionState,
+  ctx: ExtensionContext,
+): Promise<ViewerHandle | undefined> {
+  if (!state.dashboardEnabled) return undefined;
+  try {
+    const viewer = await startViewer({
+      store: state.store,
+      status: () => ({
+        recordsDir: state.store.path,
+        recordsEnabled: state.store.enabled,
+        includeOriginal: state.store.includeOriginal,
+        regexTypes: state.effectiveRegexTypes,
+        nerEnabled: state.nerEnabled,
+        nerFailure: state.nerFailure,
+        dropped: state.store.droppedCount,
+      }),
+    });
+    const message = `Rehydra 脱敏记录页面：${viewer.url}（仅本机访问）`;
+    if (ctx.hasUI) {
+      ctx.ui.notify(message, "info");
+    } else {
+      // 无 UI 的运行方式下 stdout 可能是协议通道，地址写 stderr。
+      // eslint-disable-next-line no-console
+      console.error(message);
+    }
+    return viewer;
+  } catch (error) {
+    state.log.warn("failed to start the local masking viewer", {
+      reason: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
+}
+
+/**
  * 安装 Pi 扩展。
  *
  * 该工厂由 `src/pi-extension/index.ts` 的 default export 暴露，Pi 在加载
@@ -806,11 +750,11 @@ export interface RehydraPiHandle {
  * 2. 在 `context_with_system` / `tool_call` / `tool_result` / `message_end`
  *    上挂载脱敏 / 还原钩子；
  * 3. 在 `session_shutdown` 中幂等释放所有资源；
- * 4. 注册 `/rehydra` 命令以便用户在 TUI 中查看或手动触发操作。
+ * 4. 启动本机查看页面，并把访问地址告知用户。
  */
 export function createRehydraPiExtension(pi: ExtensionAPI): void {
   // Per-session runtime state, scoped to a single Pi session.
-  const runtime: { state?: PiExtensionState } = {};
+  const runtime: { state?: PiExtensionState; viewer?: ViewerHandle } = {};
 
   const setupRuntime = async (
     cwd: string,
@@ -851,13 +795,13 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
     const rehydraInstruction = `<rehydra>\n${buildPIISystemInstruction(tagFormat)}\n</rehydra>`;
 
     const recordOptions = options.record;
-    const recorder = new MaskingRecorder(
+    const store = new MaskingRecordStore(
       {
+        ...DEFAULT_RECORD_OPTIONS,
         ...(recordOptions ?? {}),
         dir: recordOptions?.dir ?? join(homedir(), ".pi", "agent", "rehydra", "records"),
       },
       (level, message, extra) => createConsoleLogger()[level](message, extra),
-      `${process.pid}-${Math.random().toString(36).slice(2, 8)}`,
     );
 
     const sessionMap = new Map<string, AnonymizerSessionImpl>();
@@ -870,11 +814,13 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
       rehydraInstruction,
       vcsIdentities: options.vcsIdentities === true,
       effectiveRegexTypes,
-      recorder,
+      store,
       nerFailure: options.nerFailure ?? "rules",
+      nerEnabled: (anonymizerConfig.ner?.mode ?? "disabled") !== "disabled",
       lastModelWarningAt: 0,
       log: createConsoleLogger(),
       allowLiteralTagsIn: new Set(options.allowLiteralTagsIn ?? []),
+      dashboardEnabled: options.dashboard?.enabled ?? true,
       resolveSession(sessionId: string): AnonymizerSessionImpl {
         let session = sessionMap.get(sessionId);
         if (session === undefined) {
@@ -890,17 +836,26 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
   };
 
   const disposeRuntime = async (state?: PiExtensionState): Promise<void> => {
-    if (state === undefined) return;
-    // 先等记录落盘，避免会话结束时丢掉队尾
-    try {
-      await state.recorder.flush();
-    } catch {
-      // 记录层失败不影响资源释放
+    // 先关页面服务，再释放匿名器，避免页面在会话结束后继续读记录。
+    // 页面在 state 已丢失时也要关掉，否则端口会一直挂着。
+    if (runtime.viewer !== undefined) {
+      try {
+        await runtime.viewer.close();
+      } catch {
+        // 关闭失败不影响会话释放
+      }
+      runtime.viewer = undefined;
     }
+    if (state === undefined) return;
     try {
       await state.anonymizer.dispose();
     } catch {
       // Dispose is best-effort: the session is being torn down regardless.
+    }
+    try {
+      state.store.close();
+    } catch {
+      // 关闭数据库失败不影响会话释放
     }
   };
 
@@ -908,7 +863,14 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
     const cwd = ctx.sessionManager.getCwd();
     const settings = pi.getSettings();
     const rawOptions = readPiExtensionOptions(settings);
+    // 重载会再次触发 session_start：先完整释放上一轮（页面、匿名器、数据库），
+    // 否则旧连接只能等 GC，句柄与 WAL 生命周期不可控。
+    await disposeRuntime(runtime.state);
+    runtime.state = undefined;
     runtime.state = await setupRuntime(cwd, rawOptions);
+    if (runtime.state !== undefined) {
+      runtime.viewer = await startViewerService(runtime.state, ctx);
+    }
   });
 
   pi.on("session_shutdown", async () => {
@@ -933,6 +895,10 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
     // 映射，以便在 scrub 后把改动写回到原始消息的 `content` 字段。
     const rewrite = normalizeMessagesForScrub(event.messages);
     const startedAt = Date.now();
+    // 快照保存钩子实际收到的内容；scrub 会就地改写 messages，所以必须先取。
+    const beforeSnapshot = state.store.includeOriginal
+      ? serializeSnapshot(event.messages)
+      : undefined;
     let stats: ScrubCoreStats;
     try {
       stats = await scrubCore(
@@ -940,20 +906,32 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
         state.resolveSession(sessionId),
         host,
         scrubOptions,
-        state.recorder.enabled
+        state.store.enabled
           ? {
-              includeOriginal: state.recorder.includeOriginal,
-              maxRecordBytes: state.recorder.maxRecordBytes,
+              includeOriginal: state.store.includeOriginal,
+              maxRecordBytes: state.store.maxRecordBytes,
             }
           : undefined,
       );
     } catch (error) {
       // 宿主会吞掉处理器异常并继续用未脱敏内容发请求，所以在这里自己兜住：
       // 内容保持原样，本次请求照常发出，但要留下可定位的告警。
+      const reason = error instanceof Error ? error.message : String(error);
       state.log.warn("masking failed; request may contain unmasked content", {
         event: "context_with_system",
         sessionId,
-        reason: error instanceof Error ? error.message : String(error),
+        reason,
+      });
+      // 失败也记录：页面要能看出这次请求的内容没有被脱敏。
+      // 记录里只写原因码：异常 message 可能夹带原文，不能绕过关掉原文保存的配置。
+      recordRequest(state, sessionId, "context", startedAt, {
+        scrubbed: 0,
+        failure: maskingFailureCode(error),
+        snapshot: buildSnapshot(
+          beforeSnapshot,
+          serializeSnapshot(event.messages),
+          state.store.maxRecordBytes,
+        ),
       });
       return { messages: event.messages };
     }
@@ -967,7 +945,14 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
       injectRehydraInstruction(event.messages, state.rehydraInstruction);
     }
     if (stats.detectionErrors !== undefined) warnDegradedOnce(state, stats.detectionErrors);
-    recordRequest(state, sessionId, "context", startedAt, stats);
+    recordRequest(state, sessionId, "context", startedAt, {
+      ...stats,
+      snapshot: buildSnapshot(
+        beforeSnapshot,
+        state.store.includeOriginal ? serializeSnapshot(event.messages) : undefined,
+        state.store.maxRecordBytes,
+      ),
+    });
     // 共享核心就地改写了 event.messages；显式回传，保证 Pi 使用改写后的数组。
     const result: ContextEventResult = { messages: event.messages };
     return result;
@@ -1027,6 +1012,11 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
       const startedAt = Date.now();
       const hits: ScrubHit[] = [];
       const comparisons: ScrubComparison[] = [];
+      // 工具原文快照：工具结果进入下一轮请求时已被脱敏，这里先留一份原文。
+      const beforeSnapshot = state.store.includeOriginal
+        ? serializeSnapshot(event.content)
+        : undefined;
+      let failure: string | undefined;
       // 与 context 路径一致：整次事件共享模型预算，宿主取消直接结束
       const run = {
         deadline: Date.now() + MODEL_BUDGET_MS,
@@ -1051,9 +1041,9 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
                 part.text,
                 state.locale,
                 state.policy,
-                state.recorder.enabled
+                state.store.enabled
                   ? {
-                      includeOriginal: state.recorder.includeOriginal,
+                      includeOriginal: state.store.includeOriginal,
                       onEntity: (entity): void => {
                         hits.push({
                           type: entity.type,
@@ -1074,11 +1064,13 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
             } catch (error) {
               // 宿主会吞掉处理器异常并把原始内容交给模型，所以在这里兜住：
               // 该块保持原样，但要留下可定位的告警。
+              const reason = error instanceof Error ? error.message : String(error);
               state.log.warn("masking failed; tool result may reach the model unmasked", {
                 event: "tool_result",
                 tool: event.toolName,
-                reason: error instanceof Error ? error.message : String(error),
+                reason,
               });
+              failure = failure ?? maskingFailureCode(error);
               scrubbed.push(part);
               continue;
             }
@@ -1089,15 +1081,15 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
               }
             }
             if (
-              state.recorder.enabled &&
-              state.recorder.includeOriginal &&
+              state.store.enabled &&
+              state.store.includeOriginal &&
               anonymized.anonymizedText !== part.text
             ) {
               // 按字节计费，避免中文等多字节内容突破单条记录上限
               const size =
                 new TextEncoder().encode(part.text).length +
                 new TextEncoder().encode(anonymized.anonymizedText).length;
-              if (compareBytes + size > state.recorder.maxRecordBytes) {
+              if (compareBytes + size > state.store.maxRecordBytes) {
                 comparisonsTruncated = true;
               } else {
                 compareBytes += size;
@@ -1125,6 +1117,12 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
         truncated: comparisonsTruncated,
         ...(integrity === undefined ? {} : { integrity }),
         ...(detectionErrors.length === 0 ? {} : { detectionErrors }),
+        ...(failure === undefined ? {} : { failure }),
+        snapshot: buildSnapshot(
+          beforeSnapshot,
+          state.store.includeOriginal ? serializeSnapshot(result.content) : undefined,
+          state.store.maxRecordBytes,
+        ),
       });
       return result;
     },
@@ -1156,19 +1154,6 @@ export function createRehydraPiExtension(pi: ExtensionAPI): void {
     const updated: AgentMessage = { ...message, content: newContent };
     recordRelatedEvent(state, ctx.sessionManager.getSessionId(), "message_end");
     return { message: updated };
-  });
-
-  // 给用户提供一个简单的 TUI 命令，便于查看当前配置与状态。
-  pi.registerCommand("rehydra", {
-    description: "Inspect the Rehydra Pi extension status, masking records, or clear them.",
-    handler: (args: string, ctx: ExtensionContext): Promise<void> => {
-      const state = runtime.state;
-      if (state === undefined) {
-        ctx.ui.notify("Rehydra extension is not initialized.", "warning");
-        return Promise.resolve();
-      }
-      return handleRehydraCommand(args, state, ctx);
-    },
   });
 
   // 兼容 try 块中可能抛错的初始化失败：通过 warn 输出而非 fail-closed。

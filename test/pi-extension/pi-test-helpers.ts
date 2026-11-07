@@ -48,6 +48,10 @@ export interface MockPiOptions {
     includeOriginal?: boolean;
     dir?: string;
   };
+  /** 本机查看页面：测试默认关闭，避免每个用例都起一个 HTTP 服务。 */
+  dashboard?: {
+    enabled?: boolean;
+  };
   /** ui.confirm 的桩返回值。 */
   confirmAnswer?: boolean;
 }
@@ -122,15 +126,9 @@ export function createMockPiContext(options: MockPiOptions = {}): MockPiContext 
       commandHandlers.set(name, command.handler);
     },
     getSettings: () => {
-      const settings: Record<string, unknown> = {};
-      const needsOptions =
-        options.redactValues !== undefined ||
-        options.envFiles !== undefined ||
-        options.vcsIdentities !== undefined ||
-        options.allowLiteralTagsIn !== undefined ||
-        options.record !== undefined;
-      if (needsOptions) {
-        settings.rehydra = {
+      // 测试默认关掉记录与页面：既不写真实用户目录，也不占用端口。
+      const settings: Record<string, unknown> = {
+        rehydra: {
           ...(options.redactValues !== undefined
             ? { redactValues: options.redactValues }
             : {}),
@@ -141,9 +139,10 @@ export function createMockPiContext(options: MockPiOptions = {}): MockPiContext 
           ...(options.vcsIdentities !== undefined
             ? { vcsIdentities: options.vcsIdentities }
             : {}),
-          ...(options.record !== undefined ? { record: options.record } : {}),
-        };
-      }
+          record: { enabled: false, ...(options.record ?? {}) },
+          dashboard: { enabled: false, ...(options.dashboard ?? {}) },
+        },
+      };
       return settings as unknown;
     },
     getActiveTools: () => [],

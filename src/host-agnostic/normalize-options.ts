@@ -55,6 +55,8 @@ export interface RehydraSharedOptions {
   anonymizer?: AnonymizerConfig;
   /** 脱敏记录配置。 */
   record?: RecordOptions;
+  /** 本机查看页面配置。 */
+  dashboard?: DashboardOptions;
   /** 模型检测不可用时的处理。 */
   nerFailure?: "rules" | "block";
 }
@@ -63,7 +65,6 @@ export interface RehydraSharedOptions {
 export interface RecordOptions {
   enabled: boolean;
   includeOriginal: boolean;
-  keepInMemory: number;
   keepDays: number;
   keepBytes: number;
   maxRecordBytes: number;
@@ -72,12 +73,20 @@ export interface RecordOptions {
 }
 
 export const DEFAULT_RECORD_OPTIONS: Omit<RecordOptions, "dir"> = {
-  enabled: false,
-  includeOriginal: false,
-  keepInMemory: 50,
+  enabled: true,
+  includeOriginal: true,
   keepDays: 7,
   keepBytes: 32 * 1024 * 1024,
-  maxRecordBytes: 256 * 1024,
+  maxRecordBytes: 4 * 1024 * 1024,
+};
+
+/** 本机查看页面配置（已校验）。 */
+export interface DashboardOptions {
+  enabled: boolean;
+}
+
+export const DEFAULT_DASHBOARD_OPTIONS: DashboardOptions = {
+  enabled: true,
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -114,11 +123,19 @@ function asRecordOptions(value: unknown): RecordOptions | undefined {
       typeof value.includeOriginal === "boolean"
         ? value.includeOriginal
         : DEFAULT_RECORD_OPTIONS.includeOriginal,
-    keepInMemory: positive(value.keepInMemory, DEFAULT_RECORD_OPTIONS.keepInMemory),
     keepDays: positive(value.keepDays, DEFAULT_RECORD_OPTIONS.keepDays),
     keepBytes: positive(value.keepBytes, DEFAULT_RECORD_OPTIONS.keepBytes),
     maxRecordBytes: positive(value.maxRecordBytes, DEFAULT_RECORD_OPTIONS.maxRecordBytes),
     ...(dir === undefined ? {} : { dir }),
+  };
+}
+
+/** 页面选项：未知字段忽略，畸形值回落默认。 */
+function asDashboardOptions(value: unknown): DashboardOptions | undefined {
+  if (!isRecord(value)) return undefined;
+  return {
+    enabled:
+      typeof value.enabled === "boolean" ? value.enabled : DEFAULT_DASHBOARD_OPTIONS.enabled,
   };
 }
 
@@ -171,6 +188,7 @@ export function normalizeRehydraOptions(raw: unknown): RehydraSharedOptions {
     ? (source.anonymizer as AnonymizerConfig)
     : undefined;
   normalized.record = asRecordOptions(source.record);
+  normalized.dashboard = asDashboardOptions(source.dashboard) ?? DEFAULT_DASHBOARD_OPTIONS;
   // 完整匿名器配置里的显式取值优先于顶层快捷配置，避免被默认值盖掉
   const fromAnonymizer = isRecord(source.anonymizer)
     ? source.anonymizer.nerFailure
